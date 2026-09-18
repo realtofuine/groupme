@@ -60,12 +60,25 @@ func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*
 		}
 		for _, m := range group.Members {
 			isFromMe := m.UserID == groupme.ID(gc.Meta.GMID)
+			// Use the per-group nickname GroupMe already gave us in the
+			// member list, rather than relying on GetUserInfo's
+			// IndexRelations (personal contacts) lookup, which only knows
+			// about people the logged-in user has DMed 1:1 -- other group
+			// members fell through to a raw-numeric-ID fallback there.
+			name := m.Nickname
+			if name == "" {
+				name = string(m.UserID)
+			}
 			members.MemberMap.Set(bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{
 					IsFromMe: isFromMe,
 					Sender:   MakeUserID(m.UserID),
 				},
 				Membership: "join",
+				UserInfo: &bridgev2.UserInfo{
+					Name:   ptr.Ptr(name),
+					Avatar: avatarFor(m.ImageURL),
+				},
 			})
 		}
 		roomType := database.RoomTypeDefault
