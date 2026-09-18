@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
@@ -45,6 +46,31 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 	sender := bridgev2.EventSender{
 		IsFromMe: msg.UserID == groupme.ID(gc.Meta.GMID),
 		Sender:   MakeUserID(msg.UserID),
+	}
+
+	// Every GroupMe message carries the sender's name/avatar as of when it
+	// was sent (msg.Name / msg.AvatarURL). GetChatInfo's group-member sync
+	// (chatinfo.go) only knows about *current* group members via their
+	// per-group nickname, so anyone who has since left a group -- or whose
+	// membership sync hasn't run yet -- would otherwise only ever get a
+	// raw-numeric-ID ghost name. Opportunistically refresh the ghost here
+	// too, on every message, as a second source that also covers former
+	// members. Best-effort and non-blocking: message delivery must not wait
+	// on this.
+	if msg.Name != "" && msg.UserID != groupme.ID(gc.Meta.GMID) {
+		go func(gmid groupme.ID, name, avatarURL string) {
+			ctx := context.Background()
+			ghost, err := gc.Main.br.GetGhostByID(ctx, MakeUserID(gmid))
+			if err != nil {
+				gc.UserLogin.Log.Warn().Err(err).Str("gmid", string(gmid)).
+					Msg("Failed to get ghost for opportunistic name refresh from message")
+				return
+			}
+			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
+				Name:   ptr.Ptr(name),
+				Avatar: avatarFor(avatarURL),
+			})
+		}(msg.UserID, msg.Name, msg.AvatarURL)
 	}
 
 	gc.Main.br.QueueRemoteEvent(gc.UserLogin, &simplevent.Message[*groupme.Message]{
