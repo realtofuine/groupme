@@ -81,6 +81,12 @@ reference.
   GroupMe like, via `CreateLike`/`DestroyLike`).
 - **Chat/user info** (`pkg/connector/chatinfo.go`): group name/topic/avatar/
   member list, DM peer name/avatar, ghost profile sync.
+- **REST polling fallback** (`pkg/connector/poll.go`): a resilient
+  fallback/replacement for incoming-message delivery via the REST API,
+  running alongside the Faye push connection rather than instead of it —
+  added because Faye has been observed failing persistently in production
+  (see "Faye/Bayeux push connection reliability" and "REST polling
+  fallback" below for the full writeup).
 
 ## What's NOT ported (known gaps)
 
@@ -184,6 +190,121 @@ resolved; if it still fails identically, the push service itself is the
 more likely explanation and this patch (and `thirdparty/wray/`) can be
 reverted.
 
+A live deployment after the HTTP/1.1 patch above confirmed the 504s persist
+identically — the Faye handshake has now failed on every attempt for over an
+hour of continuous 10s-backoff retries, both before and after that fix. That
+rules out the HTTP/2-vs-1.1 theory as the (sole) cause and points at
+GroupMe's push infrastructure itself being degraded or blocked for this
+connection, not a client-side bug. **This is why the REST polling fallback
+below exists**: with Faye down, incoming messages (and even the logged-in
+user's own messages sent from the native GroupMe app) had no path into
+Matrix at all, since push was the only mechanism that ever fed new messages
+into the bridge.
+
+A related bug was found and fixed in the same investigation:
+`GMClient.Connect` (`pkg/connector/client.go`) used to call
+`gc.conn.SubscribeToUser(...)` — wray's Bayeux handshake, which retries
+internally with its own backoff and has no timeout — **synchronously**,
+before kicking off the initial chat sync goroutine. Since that handshake
+was observed blocking for over an hour straight, this meant a dead Faye
+server silently prevented the initial sync (and now, REST polling) from
+ever starting too, even though neither actually depends on Faye succeeding.
+`SubscribeToUser` is now called in its own goroutine, and chat sync + REST
+polling are started unconditionally right after `Connect` sets up the Faye
+listener, instead of after the handshake resolves. Faye is now purely an
+optional low-latency accelerator: incoming messages get bridged over
+whichever path (push or poll) sees them first.
+
+## REST polling fallback (`pkg/connector/poll.go`)
+
+Since the Faye push connection has proven unreliable in production (see
+above) and was, at the time of writing, the *only* mechanism through which
+new messages ever reached Matrix, `pkg/connector/poll.go` adds REST-API
+polling as a resilient fallback/replacement, running alongside Faye rather
+than instead of it.
+
+- **What it polls**: `github.com/beeper/groupme-lib` (the pinned REST
+  client, unchanged/archived — see "Dependency status" above) exposes
+  `Client.IndexMessages(ctx, groupID, *IndexMessagesQuery)` for group
+  messages (supports `SinceID`/`AfterID`/`BeforeID`/`Limit`) and
+  `Client.IndexDirectMessages(ctx, otherUserID, *IndexDirectMessagesQuery)`
+  for DMs (supports `SinceID`/`BeforeID`, keyed by `other_user_id`). Both
+  are called directly (not through the pre-existing but unused
+  `groupmeext.Client.LoadMessagesAfter` helper, which does the same thing
+  but internally uses `context.TODO()` instead of a caller-supplied
+  context — polling needs real context cancellation so the loop stops
+  promptly on `Disconnect`).
+- **Which chats get polled**: every poll tick re-lists the user's groups
+  and DM chats via `gc.Client.IndexAllGroups()` / `IndexAllChats()` — the
+  exact same calls `syncChats` (`sync.go`) uses for the initial sync — so
+  newly created chats are picked up automatically without maintaining a
+  separate chat list.
+- **Interval**: configurable via the new `poll.interval_seconds` config key
+  (`pkg/connector/config.go`, default **20s**, clamped to a 10s floor
+  regardless of config). 15-20s was chosen per the task guidance: GroupMe
+  doesn't aggressively rate-limit lightly-polled read endpoints for a
+  single personal account, but there's no reason to poll faster than that,
+  and the 10s floor guards against a config typo turning this into a tight
+  request loop. `poll.enabled` (default `true`) turns polling off entirely
+  if it's ever no longer needed.
+- **"Last seen message ID" tracking**: reuses bridgev2's own message store
+  instead of a new table — `DB.Message.GetLastNInPortal(ctx, portalKey, 1)`
+  already returns the most recently bridged message for a portal (inserted
+  there by *either* Faye or a previous poll), and that naturally survives
+  bridge restarts since it's just the existing message history. If a
+  portal has no bridged messages yet (e.g. one just created by initial
+  sync with nothing pushed to it since), there's no cursor to poll forward
+  from, so GroupMe's list endpoints are called with no since/after filter,
+  which returns their default page of the most recent messages. This isn't
+  a real backfill implementation (see "Backfill" below), but it's a
+  harmless, bounded side effect: newly-synced empty portals opportunistically
+  get a page of recent history instead of staying silent until something
+  new arrives.
+- **Conversion path**: every new message fetched by polling is passed to
+  `GMClient.HandleTextMessage` — the exact same method the Faye push
+  handler calls for live messages (`handlegroupme.go`) — so there is no
+  separate/duplicated message-to-bridgev2-event conversion logic. This
+  also means the logged-in user's own messages (sent from the native
+  GroupMe app) are bridged with no special-casing: GroupMe's message-list
+  endpoints return the same message shape (`UserID`/`RecipientID`/
+  `GroupID`) as push payloads, so `HandleTextMessage`'s existing
+  `IsFromMe`/portal-routing logic just works.
+- **Dedup**: bridgev2 core already dedupes incoming `RemoteEventMessage`s
+  by message ID before doing anything observable
+  (`Portal.handleRemoteMessage` → `DB.Message.GetAllPartsByID`, in
+  `maunium.net/go/mautrix/bridgev2/portal.go`) — if the ID already has a
+  bridged message, the event is silently ignored. Since both the Faye
+  handler and the poller feed `networkid.MessageID`s derived the same way
+  (`MakeMessageID(msg.ID)`, the raw GroupMe message ID) into the same
+  event type, this dedup applies uniformly regardless of source: whichever
+  of Faye/polling sees a given message first wins, and the other is a
+  no-op. No polling-specific dedup logic was needed.
+- **Lifecycle**: the poll loop is started in `GMClient.Connect` as its own
+  goroutine with a cancellable context (`gc.pollCancel`), and stopped in
+  `GMClient.Disconnect`; it does not depend on the Faye handshake
+  succeeding or even being attempted (see the `Connect` restructuring
+  above).
+
+**Not verified live**: like the rest of this branch, this was written and
+built (including a full Docker build with real libolm) without live
+GroupMe credentials, so the actual REST calls, their response shapes, and
+real-world rate-limit behavior have not been exercised against
+`api.groupme.com`. On next deploy, check that: portals that were empty
+after initial sync pick up a page of recent messages within one poll
+interval; a message sent from another client into an existing chat shows
+up in Matrix within ~20s even with Faye still down; and a message sent
+from the native GroupMe app by the bridge's own account also shows up
+(this was the original trigger for this work). If Faye recovers at some
+point, also confirm a message it delivers doesn't show up twice.
+
+With this change, "no reliable message delivery when Faye is down" (the
+problem that motivated this work) should be addressed: message delivery no
+longer depends on Faye succeeding at all. What's *not* addressed is
+real-time latency when Faye is down — polling caps latency at roughly one
+poll interval (~20s) instead of push's sub-second delivery — but the task
+explicitly treats that as an acceptable tradeoff for a resilient fallback,
+not a regression to fix.
+
 ## Repository layout changes
 
 - `main.go`, `user.go`, `portal.go`, `puppet.go`, `matrix.go`, `commands.go`,
@@ -224,7 +345,12 @@ built-in provisioning/backfill/space rooms).
    the initial chat sync (see above) actually creates a portal for every
    existing group/DM after login, and check whether the Faye HTTP/1.1 patch
    actually fixes the push handshake (see "Faye/Bayeux push connection
-   reliability" above) — neither has been verified live yet.
+   reliability" above) — neither has been verified live yet. Also confirm
+   the REST polling fallback (`pkg/connector/poll.go`, see "REST polling
+   fallback" above) actually delivers new messages — including the bridge's
+   own account's messages sent from the native app — within one poll
+   interval, and that an empty portal picks up a page of recent history on
+   its first poll.
 2. Fix the DM portal-key heuristic (see above) once real push payloads are
    available to confirm the actual shape of `ConversationID`/`ChatID` for
    DMs vs. groups. Note the initial sync path (`pkg/connector/sync.go`)
@@ -236,7 +362,14 @@ built-in provisioning/backfill/space rooms).
 4. Wire up double puppeting (`bridge.login_shared_secret_map`) and confirm
    it works with bridgev2's built-in support.
 5. Consider implementing `BackfillingNetworkAPI` so newly created portals
-   get recent history instead of starting empty.
+   get recent history instead of starting empty. The REST polling fallback
+   (`pkg/connector/poll.go`) opportunistically delivers one page (~20) of
+   recent messages the first time it polls a portal with no bridged
+   history yet, as a side effect of how it seeds its "since" cursor — see
+   "REST polling fallback" above — but that's incidental, not a real
+   backfill implementation (no pagination past one page, no user-facing
+   config, no distinction from a live message for e.g. notification
+   purposes).
 6. If the Faye HTTP/1.1 patch (`thirdparty/wray/`) is confirmed to fix the
    push handshake, consider upstreaming it as a real fork/PR against
    `github.com/karmanyaahm/wray` instead of carrying a local `replace`
