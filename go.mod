@@ -41,3 +41,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
+
+// Local patch to force HTTP/1.1 for GroupMe's Faye/Bayeux push transport;
+// see thirdparty/wray/README.md.
+replace github.com/karmanyaahm/wray => ./thirdparty/wray
