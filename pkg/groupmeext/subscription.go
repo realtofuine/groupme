@@ -1,7 +1,7 @@
 package groupmeext
 
 import (
-	log "maunium.net/go/maulogger/v2"
+	"github.com/rs/zerolog"
 
 	"github.com/karmanyaahm/wray"
 
@@ -9,20 +9,20 @@ import (
 )
 
 type fayeLogger struct {
-	log.Logger
+	zerolog.Logger
 }
 
 func (f fayeLogger) Debugf(i string, a ...interface{}) {
-	f.Logger.Debugfln(i, a...)
+	f.Logger.Debug().Msgf(i, a...)
 }
 func (f fayeLogger) Errorf(i string, a ...interface{}) {
-	f.Logger.Errorfln(i, a...)
+	f.Logger.Error().Msgf(i, a...)
 }
 func (f fayeLogger) Warnf(i string, a ...interface{}) {
-	f.Logger.Warnfln(i, a...)
+	f.Logger.Warn().Msgf(i, a...)
 }
 func (f fayeLogger) Infof(i string, a ...interface{}) {
-	f.Logger.Infofln(i, a...)
+	f.Logger.Info().Msgf(i, a...)
 }
 
 type FayeClient struct {
@@ -48,10 +48,10 @@ func (a *AuthExt) Out(m wray.Message) {
 	groupme.OutMsgProc(m)
 }
 
-func NewFayeClient(logger log.Logger) *FayeClient {
+func NewFayeClient(logger zerolog.Logger) *FayeClient {
 
 	fc := &FayeClient{wray.NewFayeClient(groupme.PushServer)}
-	fc.SetLogger(fayeLogger{logger.Sub("FayeClient")})
+	fc.SetLogger(fayeLogger{logger.With().Str("component", "FayeClient").Logger()})
 	fc.AddExtension(&AuthExt{})
 	//fc.AddExtension(fc.FayeClient)
 
