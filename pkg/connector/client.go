@@ -90,6 +90,15 @@ func (gc *GMClient) Connect(ctx context.Context) {
 	}
 	gc.connected = true
 	gc.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+
+	// Portals are otherwise only ever created reactively from live push
+	// events (see handlegroupme.go); without this, a freshly logged-in user
+	// gets zero portals until something happens to trigger a push. Run
+	// asynchronously (and with a context detached from the one passed to
+	// Connect) so a slow/large sync doesn't hold up Connect's caller -- some
+	// callers (e.g. the unknown-error reconnect path) invoke Connect
+	// synchronously. See sync.go.
+	go gc.syncChats(context.WithoutCancel(ctx))
 }
 
 func (gc *GMClient) Disconnect() {
