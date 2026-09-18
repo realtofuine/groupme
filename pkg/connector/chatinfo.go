@@ -90,21 +90,50 @@ func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*
 			Type:    &roomType,
 		}, nil
 	case PortalTypeDM:
-		var other *groupme.User
-		relations, err := gc.Client.IndexRelations(ctx)
-		if err == nil {
-			for _, u := range relations {
-				if u.ID == gmid {
-					other = u
+		name := string(gmid)
+		var avatarURL string
+		var found bool
+
+		// Primary source: the "your chats" listing, which is guaranteed to
+		// include every DM thread the account actually has (this is what
+		// sync.go uses to discover DM portals in the first place). Preferred
+		// over IndexRelations (personal contacts), which -- confirmed live,
+		// see NOTES.md -- does NOT necessarily include everyone there's an
+		// active DM thread with, causing DM room names to fall back to a raw
+		// numeric ID for such people.
+		if chats, err := gc.Client.IndexAllChats(); err == nil {
+			for _, c := range chats {
+				if c.OtherUser.ID == gmid {
+					name = c.OtherUser.Name
+					avatarURL = c.OtherUser.AvatarURL
+					found = true
 					break
 				}
 			}
 		}
-		name := string(gmid)
-		var avatarURL string
-		if other != nil {
-			name = other.Name
-			avatarURL = other.AvatarURL
+
+		// Fallback: personal contacts list.
+		if !found {
+			if relations, err := gc.Client.IndexRelations(ctx); err == nil {
+				for _, u := range relations {
+					if u.ID == gmid {
+						name = u.Name
+						avatarURL = u.AvatarURL
+						found = true
+						break
+					}
+				}
+			}
+		}
+
+		// Last resort before the raw ID: whatever name we already know for
+		// this ghost, e.g. from HandleTextMessage's message-sender-based
+		// refresh (handlegroupme.go), so this doesn't regress a name we
+		// already have to worse info.
+		if !found {
+			if ghost, err := gc.Main.br.GetExistingGhostByID(ctx, MakeUserID(gmid)); err == nil && ghost != nil && ghost.Name != "" && ghost.Name != string(gmid) {
+				name = ghost.Name
+			}
 		}
 		roomType := database.RoomTypeDM
 		members := &bridgev2.ChatMemberList{
