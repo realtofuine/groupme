@@ -1,0 +1,4 @@
+# Settings related to how the bridge connects to GroupMe's real-time push service.
+push:
+    # How long to wait (in seconds) for the initial GroupMe push connection before giving up.
+    connection_timeout: 20
