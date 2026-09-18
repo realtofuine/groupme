@@ -29,8 +29,26 @@ type PushConfig struct {
 	ConnectionTimeout int `yaml:"connection_timeout"`
 }
 
+// PollConfig controls the REST-API polling fallback (see pkg/connector/poll.go
+// and NOTES.md "REST polling fallback"), which periodically fetches new
+// messages via GroupMe's REST API independent of whether the Faye push
+// connection above is working.
+type PollConfig struct {
+	// Enabled turns REST polling on/off. Defaults to true: the Faye push
+	// connection has been observed to fail for extended periods in
+	// production, and polling is this bridge's only other way to learn
+	// about new messages. It's safe to leave enabled even when Faye is
+	// working, since bridgev2 dedupes incoming messages by ID.
+	Enabled bool `yaml:"enabled"`
+	// IntervalSeconds is how often, in seconds, each known chat is polled
+	// for new messages. Values below 10 are clamped up to 10 to avoid
+	// hammering GroupMe's API; unset or <= 0 defaults to 20.
+	IntervalSeconds int `yaml:"interval_seconds"`
+}
+
 type Config struct {
 	Push PushConfig `yaml:"push"`
+	Poll PollConfig `yaml:"poll"`
 }
 
 func (gc *GMConnector) GetConfig() (example string, data any, upgrader up.Upgrader) {
@@ -39,4 +57,6 @@ func (gc *GMConnector) GetConfig() (example string, data any, upgrader up.Upgrad
 
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Int, "push", "connection_timeout")
+	helper.Copy(up.Bool, "poll", "enabled")
+	helper.Copy(up.Int, "poll", "interval_seconds")
 }
