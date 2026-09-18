@@ -19,6 +19,9 @@ package connector
 import (
 	"context"
 	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -81,7 +84,7 @@ func (gc *GMClient) Connect(ctx context.Context) {
 
 	sub := groupme.NewPushSubscription(ctx)
 	gc.conn = &sub
-	fayeClient := groupmeext.NewFayeClient(log)
+	fayeClient := gc.selectFayeClient(ctx, log)
 	gc.conn.StartListening(ctx, fayeClient)
 	gc.conn.AddFullHandler(gc)
 
@@ -135,6 +138,31 @@ func (gc *GMClient) Connect(ctx context.Context) {
 	gc.pollCancel = cancel
 	gc.pollMu.Unlock()
 	go gc.pollMessages(pollCtx)
+}
+
+// selectFayeClient picks the real-time push transport to use for this
+// connection: GroupMe's push server (push.groupme.com/faye) is a Bayeux
+// service that historically supported HTTP long-polling
+// (github.com/karmanyaahm/wray, vendored at thirdparty/wray/), but current
+// GroupMe docs recommend websockets and long-polling handshakes have been
+// observed to hang/504 indefinitely in production (see NOTES.md). Websocket
+// is tried first via a one-shot reachability probe (dial + handshake, then
+// discarded); on any failure this falls back to the long-polling client
+// so a websocket-specific outage (or a network that blocks upgrades) doesn't
+// take down push entirely. If the probe succeeds, the same websocket client
+// is reused for the real connection instead of re-probing.
+func (gc *GMClient) selectFayeClient(ctx context.Context, log zerolog.Logger) groupme.FayeClient {
+	wsClient := groupmeext.NewWSFayeClient(log)
+
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := wsClient.Probe(probeCtx); err != nil {
+		log.Warn().Err(err).Msg("GroupMe push websocket handshake failed, falling back to HTTP long-polling transport")
+		return groupmeext.NewFayeClient(log)
+	}
+
+	log.Info().Msg("Using GroupMe push websocket transport")
+	return wsClient
 }
 
 func (gc *GMClient) Disconnect() {

@@ -22,7 +22,9 @@ reference.
   production (real libolm is better tested than the pure-Go fallback).
 - `docker build -t groupme-bridge:revival2 .` succeeds using
   `golang:1.27-alpine3.23` as the build image (re-verified after the
-  initial-sync and Faye HTTP/1.1 changes below).
+  initial-sync and Faye HTTP/1.1 changes below; re-verified again as
+  `groupme-bridge:revival4` after the websocket push transport change,
+  see "Bayeux-over-websocket push transport" below).
 - A live deploy against a real GroupMe account and Synapse homeserver
   confirmed login works end-to-end (access-token validation succeeds, bridge
   logs in as the real user), but **zero portal rooms were created**
@@ -145,7 +147,12 @@ reference.
   protocol over HTTP long-polling and doesn't depend on mautrix-go, so the
   version bump didn't require touching it beyond adapting its logger
   interface (`pkg/groupmeext/subscription.go`) from the now-removed
-  `maulogger/v2` to `zerolog` (which bridgev2 uses everywhere).
+  `maulogger/v2` to `zerolog` (which bridgev2 uses everywhere). Still used
+  as the fallback transport, see "Bayeux-over-websocket push transport"
+  below.
+- `github.com/coder/websocket` **v1.8.15**: new direct dependency (was
+  already present indirectly via `maunium.net/go/mautrix`). Used by the new
+  `pkg/groupmeext/ws_faye.go` websocket Faye transport, see below.
 
 ## Faye/Bayeux push connection reliability (`push.groupme.com/faye`)
 
@@ -305,6 +312,140 @@ poll interval (~20s) instead of push's sub-second delivery — but the task
 explicitly treats that as an acceptable tradeoff for a resilient fallback,
 not a regression to fix.
 
+**Update (2026-09-18): root cause identified as long-polling being
+deprioritized/degraded server-side, not (only) HTTP/2.** The live
+confirmation above that the HTTP/1.1 patch didn't change the 504 behavior
+at all was the first strong signal that HTTP/2 wasn't the (sole) cause.
+Re-checking GroupMe's current docs turned up a detail the original
+investigation missed: `dev.groupme.com/tutorials/push` now explicitly says
+"you can perform long-polling over HTTP, but we recommend dropping down to
+websockets if you have the option," and the community-maintained protocol
+docs (https://groupme-js.github.io/GroupMeCommunityDocs/api/ws/) show the
+*current* handshake payload declaring
+`"supportedConnectionTypes": ["websocket"]`, not `["long-polling"]`. Both
+were fetched directly (not from memory/paraphrase) on 2026-09-18 to confirm
+the literal JSON before implementing anything against them. `wray` (our
+Faye client, vendored at `thirdparty/wray/`) has zero websocket support —
+it's HTTP-long-polling-only. The working theory is that GroupMe's backend
+has deprioritized the long-polling transport path in favor of websocket,
+which would produce exactly the symptom seen (hangs/504s instead of a
+clean protocol-level rejection). The HTTP/1.1 patch above is still kept
+(it's a real, independently-justified fix, and is also now applied to the
+websocket dial handshake for the same reason — see below) but is no longer
+assumed to be sufficient by itself. The REST polling fallback above and
+the websocket transport below are complementary, not alternatives: polling
+guarantees delivery (bounded by its interval) regardless of which push
+transport (if either) is working; websocket is an attempt to restore
+actual real-time push on top of that safety net.
+
+## Bayeux-over-websocket push transport (new, 2026-09-18)
+
+Real-time push now has two transport implementations behind the same
+`groupme.FayeClient` interface (`Listen()` / `WaitSubscribe(...)` from
+`github.com/beeper/groupme-lib`'s `real_time.go`):
+
+- `groupmeext.FayeClient` (`pkg/groupmeext/subscription.go`) — the
+  pre-existing wray-based HTTP long-polling client.
+- `groupmeext.WSFayeClient` (`pkg/groupmeext/ws_faye.go`, **new**) — a
+  from-scratch Bayeux client that speaks the same protocol over a
+  websocket connection to `wss://push.groupme.com/faye` (same host/path as
+  the HTTP transport, confirmed against both doc sources above — only the
+  scheme and `supportedConnectionTypes` differ).
+
+**Library choice**: `github.com/coder/websocket` (formerly `nhooyr.io/websocket`),
+pinned at `v1.8.15`. It was already present in `go.mod` as an *indirect*
+dependency — pulled in transitively by `maunium.net/go/mautrix`'s own
+appservice websocket transport (`maunium.net/go/mautrix@v0.31.0/appservice/websocket.go`)
+— so using it directly here adds no new dependency to the build, reuses a
+version already exercised by the upstream mautrix-go project, and has a
+smaller/simpler API surface than `gorilla/websocket` (context-based
+Read/Write, no manual ping/pong plumbing needed for this use case). It's
+now promoted from an indirect to a direct `require` in `go.mod` via
+`go mod tidy`.
+
+**Protocol implementation** (verified against the literal JSON from both
+doc sources fetched in this session, not paraphrased):
+
+- Handshake: `{"channel":"/meta/handshake","version":"1.0","supportedConnectionTypes":["websocket"],"id":"<n>"}`,
+  sent as a one-element JSON array (the Bayeux spec's message envelope is
+  always an array regardless of transport — matches what `thirdparty/wray`
+  already does for the HTTP POST body).
+- Subscribe: `{"channel":"/meta/subscribe","clientId":"<id>","subscription":"<channel>","id":"<n>","ext":{"access_token":"...","timestamp":...}}`.
+  The `ext` auth field is populated by calling `groupme.OutMsgProc` from
+  `real_time.go` directly (same function the wray path uses via its
+  `AuthExt` extension) instead of reimplementing the
+  access_token/timestamp logic — this was an explicit goal so the two
+  transports can't drift on auth behavior.
+- Connect/heartbeat: `{"channel":"/meta/connect","clientId":"<id>","connectionType":"websocket","id":"<n>"}`,
+  sent in a continuous cycle (next connect fires as soon as a response to
+  the previous one arrives), per the Bayeux spec's liveness/advice
+  mechanism — the websocket itself doesn't need this to receive pushed
+  messages (those can arrive as independent frames at any time), but
+  `advice.reconnect` values (`"none"`/`"handshake"`) are only delivered via
+  connect responses, so it's kept running to honor server-directed
+  reconnect/rehandshake requests.
+- Server-pushed events (message/like/membership/etc.) arrive as ordinary
+  Bayeux data messages on channels like `/user/<id>`, `/group/<id>`,
+  `/direct_message/<id1>_<id2>`; these are matched against the
+  channel->`chan groupme.PushMessage` map populated by `WaitSubscribe` and
+  written directly into it. From there they flow into
+  `groupme.PushSubscription`'s existing dispatch goroutine
+  (`StartListening` in `real_time.go`) exactly like long-polling messages
+  do, reaching the same `RealTimeHandlers`/`HandlerAll` methods already
+  implemented on `GMClient` in `pkg/connector/handlegroupme.go` —
+  **no changes were made to `handlegroupme.go` or to `groupme-lib`** for
+  this; the whole point of implementing `groupme.FayeClient` /
+  `groupme.PushMessage` was to hook into that existing, already-wired
+  dispatch path rather than duplicating it.
+- The websocket dial's HTTP client also has `TLSNextProto` forced to
+  disable HTTP/2, mirroring the `thirdparty/wray` patch, since RFC 6455's
+  `Connection: Upgrade` handshake isn't valid under HTTP/2 and the same
+  host already showed HTTP/2-related hangs for the long-polling path.
+- Reconnection: `WSFayeClient.Listen()` loops forever, redialing +
+  re-handshaking + resubscribing all previously-registered channels with
+  exponential backoff (1s doubling to a 60s cap) on any failure — the
+  `FayeClient` interface has no explicit stop/close signal, matching the
+  pre-existing wray client's contract (`GMClient.Disconnect()` just drops
+  its reference; see the comment there).
+
+**Transport selection / fallback** (`pkg/connector/client.go`,
+`GMClient.selectFayeClient`): on every `Connect()`, a `WSFayeClient` is
+created and probed with a one-shot dial+handshake (`WSFayeClient.Probe`,
+20s timeout) *before* being handed to `PushSubscription.StartListening`.
+If the probe succeeds, that same client is reused for the real connection
+(websocket is primary). If it fails for any reason, the code falls back to
+constructing the pre-existing wray-based long-polling `FayeClient`, so a
+websocket-specific outage or a network that blocks the upgrade doesn't
+take down push entirely. This was chosen over a fully dynamic
+runtime-switching design (e.g. falling back mid-connection after Listen()
+has already started) as a deliberate scope tradeoff — a clean one-shot
+probe-then-commit covers the realistic failure mode (transport unreachable
+at connect time) without adding the complexity of tearing down and
+re-homing an in-flight `PushSubscription` mid-session.
+
+**What's verified vs. not**: `go build -tags goolm ./...`, `go vet -tags
+goolm ./...`, and `docker build` (using real libolm, no build tag) all
+succeed with this change — the protocol implementation is structurally
+correct per the current documented JSON formats and compiles/type-checks
+against `groupme-lib`'s real interfaces. **None of this has been exercised
+against the live `push.groupme.com/faye` endpoint** — no GroupMe
+credentials or network path were available in this session either (same
+limitation as every previous session in this investigation). The specific
+things a live deploy should check first: (1) does the websocket handshake
+actually succeed where long-polling hung/504'd — this is the whole premise
+of this change; (2) does GroupMe's server-pushed data land in the plain
+(non-array) object shape assumed by `decodeBayeuxFrame`'s fallback path, or
+always as arrays — the code handles both, but the actual framing was never
+observed live; (3) does the `/meta/connect` continuous cycle behave
+sanely over a persistent socket (no unexpected rate limiting from sending
+one every response-turnaround) — the Bayeux spec doesn't mandate a
+different cadence for websocket vs. long-polling, but GroupMe's specific
+server behavior here is unconfirmed; (4) whether the HTTP/2-disabling dial
+client is even necessary for the websocket path (unlike the long-polling
+case, no independent `curl` reproduction of a websocket-specific hang
+exists yet — it was applied preemptively based on the same host and the
+general RFC 6455-vs-HTTP/2 mismatch, not a directly observed failure).
+
 ## Repository layout changes
 
 - `main.go`, `user.go`, `portal.go`, `puppet.go`, `matrix.go`, `commands.go`,
@@ -343,14 +484,22 @@ built-in provisioning/backfill/space rooms).
    exercise login, an incoming group message, an incoming DM, an outgoing
    message, and a like/reaction in both directions. In particular, confirm
    the initial chat sync (see above) actually creates a portal for every
-   existing group/DM after login, and check whether the Faye HTTP/1.1 patch
-   actually fixes the push handshake (see "Faye/Bayeux push connection
-   reliability" above) — neither has been verified live yet. Also confirm
+   existing group/DM after login, and check whether the new websocket push
+   transport (see "Bayeux-over-websocket push transport" above) actually
+   handshakes successfully against `wss://push.groupme.com/faye` where the
+   long-polling path hung/504'd — this is the single most important thing
+   to verify live, since it's the entire premise of that change and
+   nothing about it has been exercised against the real server yet. Check
+   the logs for "Using GroupMe push websocket transport" (success) vs.
+   "falling back to HTTP long-polling transport" (probe failed) from
+   `GMClient.selectFayeClient` in `pkg/connector/client.go`. Also confirm
    the REST polling fallback (`pkg/connector/poll.go`, see "REST polling
    fallback" above) actually delivers new messages — including the bridge's
    own account's messages sent from the native app — within one poll
    interval, and that an empty portal picks up a page of recent history on
-   its first poll.
+   its first poll. Between the two, message delivery should now work even
+   if the websocket probe falls back to long-polling and long-polling is
+   still degraded/down.
 2. Fix the DM portal-key heuristic (see above) once real push payloads are
    available to confirm the actual shape of `ConversationID`/`ChatID` for
    DMs vs. groups. Note the initial sync path (`pkg/connector/sync.go`)
