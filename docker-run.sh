@@ -6,11 +6,11 @@ fi
 
 # Define functions.
 function fixperms {
-	chown -R $UID:$GID /data /opt/go-groupme
+	chown -R $UID:$GID /data
 }
 
 if [[ ! -f /data/config.yaml ]]; then
-	cp /opt/go-groupme/example-config.yaml /data/config.yaml
+	/usr/bin/mautrix-groupme -c /data/config.yaml -e
 	echo "Didn't find a config file."
 	echo "Copied default config file to /data/config.yaml"
 	echo "Modify that config file to your liking."
@@ -19,13 +19,13 @@ if [[ ! -f /data/config.yaml ]]; then
 fi
 
 if [[ ! -f /data/registration.yaml ]]; then
-	/usr/bin/go-groupme -g -c /data/config.yaml -r /data/registration.yaml
+	/usr/bin/mautrix-groupme -g -c /data/config.yaml -r /data/registration.yaml || exit $?
 	echo "Didn't find a registration file."
 	echo "Generated one for you."
-	echo "Copy that over to synapses app service directory."
+	echo "See https://docs.mau.fi/bridges/general/registering-appservices.html on how to use it."
 	exit
 fi
 
 cd /data
 fixperms
-exec su-exec $UID:$GID /usr/bin/go-groupme
+exec su-exec $UID:$GID /usr/bin/mautrix-groupme
