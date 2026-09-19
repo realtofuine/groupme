@@ -525,3 +525,91 @@ built-in provisioning/backfill/space rooms).
    indefinitely. If it *doesn't* fix the handshake, that's strong evidence
    the problem is external (GroupMe's push service itself), and the patch
    can be reverted.
+
+## WebSocket reconnect-cycle fix (2026-09-19)
+
+The websocket push transport (see "Bayeux-over-websocket push transport"
+above) worked but reconnected roughly every 45 seconds instead of staying
+open — self-healing each time (~2s), so not a correctness problem, but not
+what "stable" should look like either.
+
+Root cause: `connectLoop` (`pkg/groupmeext/ws_faye.go`) wrapped the wait
+for GroupMe's `/meta/connect` response in a 45-second `connCtx` timeout and
+treated a timeout as fatal, forcing a full reconnect. But `/meta/connect`
+is a long-poll-style endpoint by design under Bayeux — GroupMe holds it
+open until there's something to deliver, so a slow/quiet response is
+normal, not a sign of a dead connection. The 45s ceiling was just
+rediscovering that fact every time and reconnecting needlessly.
+
+Fix: removed the timeout on waiting for the response (only the *send* of
+the connect request is still bounded, at 15s — that one should be fast).
+Real liveness detection was added separately: a `pingLoop` that sends an
+actual WebSocket-level `conn.Ping` every 30s (10s timeout), wired into
+`connectAndRun`'s `select` via a new `pingErrCh` — so a genuinely dead
+connection is still caught quickly, just via the transport's own liveness
+primitive instead of misreading a quiet Bayeux response as one.
+
+Verified live: 9+ minutes of continuous connection, zero reconnects, after
+this landed (previously: cycling every ~45s indefinitely).
+
+## Health-check/alerting system, and a REST polling rate-limiting bug it caught (2026-09-19)
+
+Added a small out-of-band monitoring layer, not part of the bridge itself:
+a systemd oneshot (`matrix-health-check.service` + `.timer`, every 5 min)
+running `/matrix/health-check/check.sh`, which checks that all relevant
+systemd units (Synapse, each bridge, Postgres, etc.) are active and greps
+`journalctl --since <last run>` for `\bERR\b|\bFATAL\b|panic`. On a
+problem, it posts to a dedicated Matrix room via curl using the
+double-puppet `as_token` (same one already configured for double
+puppeting — no new credential). State (last-checked timestamp per unit) is
+tracked in `/matrix/health-check/state/`.
+
+This isn't part of the bridge's own code/this repo — it lives on the host
+at `/matrix/health-check/` — but it's documented here because within
+minutes of going live, it caught a real bug: the GroupMe bridge was
+logging `Err()`-level lines that turned out to be genuine GroupMe API
+rate-limit responses (`Error Code 429`), not one-off noise.
+
+**Root cause**: an earlier fix this branch made (see "REST polling
+fallback" above, the reaction-polling-skipped-on-no-new-messages fix)
+merged what had been two REST requests per chat per poll tick into one —
+correct on its own, but with ~80 chats at the then-current 20s poll
+interval, even *one* request per chat per tick is ~4 req/s, all fired
+back-to-back at the top of every tick. GroupMe's rate limiting reacts to
+that bursty pattern specifically, not just total steady-state volume.
+Confirmed precisely by counting the literal string `Error Code 429` in
+the logs (an earlier, looser check that just grepped for the substring
+`429` gave misleadingly high/noisy counts, since that also matches
+timestamps and IDs elsewhere in log lines) — 362 and 500 genuine 429s
+across two consecutive runs at the old settings. Disabling polling
+entirely (`poll.enabled: false` in the live config) immediately dropped
+that to 0, confirming polling itself (not push/resync traffic) as the
+cause.
+
+**Fix** (`pkg/connector/poll.go`, `client.go`, `thirdparty/groupme-lib/data_types.go`):
+- Stagger the per-chat requests across 80% of the poll interval instead of
+  firing them all at once (`pollOnce`).
+- Back off a specific chat for 3 minutes after an actual 429/420 from it,
+  instead of retrying on the very next tick regardless
+  (`checkPollBackoff`/`maybeBackoffPoll`, backed by a new `pollBackoff`
+  map on `GMClient`, `client.go`).
+- Raise the default/minimum poll interval to 60s/30s (was 20s/10s) to cut
+  steady-state request rate independent of the above.
+- Added `groupme.HTTPTooManyRequests = 429` to the vendored library, which
+  only had the older `HTTPEnhanceYourCalm = 420` the original author
+  apparently expected instead — 429 is what GroupMe actually returns live.
+- `logPollError` now logs 429/420 at `Warn()`, not `Err()`, since
+  `maybeBackoffPoll` already self-mitigates it — an `Err()` line implies
+  something needs attention, which would otherwise also falsely trip the
+  health-check's own ERR-pattern grep on an already-handled condition.
+
+Verified live: 20 consecutive 90-second windows (~6.5 min total) at 0
+genuine 429s after deploying, versus hundreds before. Live config
+(`/matrix/mautrix-groupme/data/config.yaml`, not in git) updated to
+`poll.enabled: true`, `interval_seconds: 60` to match.
+
+This is a good example of why the health-check system was worth building
+beyond just "peace of mind": it surfaced a real, previously-invisible
+problem (the bridge was silently getting rate-limited in production)
+within minutes of being deployed, well before it would have been noticed
+any other way.

@@ -18,14 +18,21 @@ behind each fix.
   room immediately (not just ones that happen to receive a new message).
 - **Incoming messages**, delivered two ways simultaneously:
   - A **WebSocket** Bayeux connection (`wss://push.groupme.com/faye`) for
-    near-real-time push. Handshake succeeds, but the connection currently
-    cycles/reconnects roughly every 45 seconds rather than staying open
-    indefinitely — self-heals within ~2s each time, not investigated
-    further since the fallback below covers any gap.
-  - A **REST polling fallback** (~20s interval, configurable) that works
+    near-real-time push. Previously cycled/reconnected roughly every 45
+    seconds due to misreading a normal quiet `/meta/connect` long-poll
+    response as a dead connection; fixed (real WebSocket-level ping is now
+    the actual liveness check instead) and verified live at 9+ minutes
+    continuous, zero reconnects. See NOTES.md "WebSocket reconnect-cycle
+    fix" for details.
+  - A **REST polling fallback** (60s interval, configurable) that works
     independently of the WebSocket, so message delivery doesn't depend on
     push being healthy at all. If the WebSocket probe fails outright at
     connect time, the bridge falls back to HTTP long-polling instead.
+    Requests are staggered across the interval with per-chat backoff on
+    rate-limit responses — a naive tight-interval/burst version of this
+    got the account 429'd in production; see NOTES.md "Health-check/
+    alerting system, and a REST polling rate-limiting bug it caught" for
+    the full incident and fix.
 - **Reactions**, both directions, with the **actual emoji** GroupMe
   supports (❤️ 👍 🤣 🎉 🔥 😮 👀 😭 🥺 🙏 💀 🫶 🤬 💅 🫠) — not just a
   generic heart. This required patching the vendored GroupMe API client
@@ -42,6 +49,13 @@ behind each fix.
   list, which — confirmed live — doesn't include everyone you have an
   active chat with). Names also opportunistically refresh from message
   sender data, which additionally covers people who've since left a group.
+- **Health-check/alerting** (outside this repo, lives on the host at
+  `/matrix/health-check/`): a systemd timer every 5 minutes checks that
+  all Matrix-related services are up and greps recent logs for
+  errors/panics, posting to a dedicated Matrix room if it finds a problem.
+  Not bridge-specific, but worth knowing about — it's what caught the
+  rate-limiting bug above in the first place. See NOTES.md for details if
+  it ever needs adjusting.
 
 ## Implemented but not yet verified live
 
