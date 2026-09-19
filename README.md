@@ -56,6 +56,15 @@ behind each fix.
   Not bridge-specific, but worth knowing about — it's what caught the
   rate-limiting bug above in the first place. See NOTES.md for details if
   it ever needs adjusting.
+- **Sustained websocket-outage alerting**: a single websocket reconnect is
+  silent by design (expected, self-heals in ~2s). But if the websocket
+  hasn't held a successful handshake in over 5 minutes — meaning
+  real-time push is degraded and delivery has fallen back entirely to the
+  60s-interval REST poll — the bridge logs an Error-level line that the
+  health-check above picks up, repeating every 15 minutes while the
+  outage continues. No message loss either way; this is purely about
+  visibility into "real-time delivery has been down for a while." See
+  NOTES.md "Sustained websocket-outage alerting."
 
 ## Implemented but not yet verified live
 

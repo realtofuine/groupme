@@ -613,3 +613,36 @@ beyond just "peace of mind": it surfaced a real, previously-invisible
 problem (the bridge was silently getting rate-limited in production)
 within minutes of being deployed, well before it would have been noticed
 any other way.
+
+## Sustained websocket-outage alerting (2026-09-19)
+
+Follow-up gap found while explaining the push/polling architecture: with
+the reconnect-cycle fix above landed, a *single* websocket reconnect is
+expected and harmless (self-heals in ~2s, logged at Warn). But a
+*sustained* outage — websocket genuinely down for an extended period,
+not just one blip — produced zero signal to the health-check alerting:
+the bridge process doesn't crash (REST polling keeps delivering messages
+independently, just delayed up to the poll interval instead of
+near-instant), and every reconnect-related log line in `ws_faye.go` is
+deliberately Warn, not Error, specifically because a single reconnect
+isn't failure-worthy. Net effect: a websocket down for hours would be
+completely invisible unless someone went and read the logs — no data
+loss, but no visibility either.
+
+Fixed in `pkg/groupmeext/ws_faye.go`: `WSFayeClient` now tracks
+`lastConnected`, reset on every successful Bayeux handshake
+(`markConnected`, called from `connectAndRun`). If `Listen`'s reconnect
+loop finds more than 5 minutes have passed since the last successful
+handshake, it logs one Error-level line (`maybeLogSustainedDegradation`)
+— which the health-check script above already greps for, so this needed
+no changes on that side at all. Repeats every 15 minutes if the outage
+continues, rather than alerting once and going silent for a multi-hour
+outage.
+
+Verified: builds, deploys cleanly, websocket handshake still succeeds
+immediately on a normal restart (no regression to the happy path). The
+alerting path itself (an actual 5+ minute outage) hasn't been separately
+forced/tested live — would need e.g. blocking outbound access to
+`push.groupme.com` temporarily to verify end-to-end, not done here since
+that would have disrupted real-time delivery unnecessarily for something
+already reasoned through carefully.
