@@ -50,6 +50,13 @@ const (
 	metaConnect   = "/meta/connect"
 )
 
+// sustainedDegradationThreshold and degradedAlertRepeatInterval govern
+// maybeLogSustainedDegradation, below.
+const (
+	sustainedDegradationThreshold = 5 * time.Minute
+	degradedAlertRepeatInterval   = 15 * time.Minute
+)
+
 // wsDialHTTPClient is used for the WebSocket upgrade handshake, exactly
 // mirroring the HTTP/1.1-forcing patch already applied to the vendored
 // long-polling transport (thirdparty/wray/http_transport.go). The RFC 6455
@@ -135,6 +142,15 @@ type WSFayeClient struct {
 
 	writeMu sync.Mutex
 	nextID  atomic.Int64
+
+	// connStateMu guards lastConnected/nextDegradedAt, used only by
+	// markConnected/maybeLogSustainedDegradation below to detect and alert
+	// on sustained (not just momentary) connection loss. Kept separate
+	// from mu since it's logically independent of the actual conn/subs
+	// state that mu protects.
+	connStateMu    sync.Mutex
+	lastConnected  time.Time
+	nextDegradedAt time.Time
 }
 
 var _ groupme.FayeClient = (*WSFayeClient)(nil)
@@ -147,6 +163,12 @@ func NewWSFayeClient(logger zerolog.Logger) *WSFayeClient {
 		url:  wsPushServer,
 		log:  logger.With().Str("component", "WSFayeClient").Logger(),
 		subs: map[string]chan groupme.PushMessage{},
+		// Starts the "how long has this been down" clock at construction,
+		// not the zero value -- otherwise a connection that fails on its
+		// very first attempt would immediately look like it's been down
+		// for decades and skip straight past sustainedDegradationThreshold
+		// instead of getting the same grace period a later failure would.
+		lastConnected: time.Now(),
 	}
 }
 
@@ -481,6 +503,53 @@ func (c *WSFayeClient) pingLoop(ctx context.Context, conn *websocket.Conn) error
 	}
 }
 
+// markConnected records that the websocket just completed a successful
+// Bayeux handshake, resetting the "how long has this been down" clock that
+// maybeLogSustainedDegradation checks. Also clears any pending repeat-alert
+// cooldown, so a *new* degradation period (after a real recovery) gets its
+// own prompt alert instead of inheriting the previous period's cooldown.
+func (c *WSFayeClient) markConnected() {
+	c.connStateMu.Lock()
+	c.lastConnected = time.Now()
+	c.nextDegradedAt = time.Time{}
+	c.connStateMu.Unlock()
+}
+
+// maybeLogSustainedDegradation logs an Error-level line if the websocket
+// has not completed a successful handshake in over
+// sustainedDegradationThreshold. Deliberately Error, unlike every other
+// reconnect-related log line in this file (Listen, connectLoop, etc. all
+// log at Warn): a single reconnect is expected and self-healing and
+// shouldn't page anyone, but *sustained* inability to reconnect at all is
+// exactly the kind of thing worth surfacing -- the host's health-check
+// alerting (see NOTES.md "Health-check/alerting system") greps for
+// Error/Fatal/panic-level log lines specifically so this reaches it
+// without any changes needed on that side.
+//
+// Note this doesn't mean messages are being lost: the REST polling
+// fallback (pkg/connector/poll.go) is fully independent of this and keeps
+// delivering everything, just delayed up to the poll interval (60s by
+// default) instead of near-instant. This alert is about *that*
+// degradation being worth knowing about, not data loss.
+//
+// Throttled to degradedAlertRepeatInterval so a prolonged outage doesn't
+// spam an alert every single backoff cycle (which can be as short as 1s);
+// it still repeats periodically rather than alerting only once, so a
+// multi-hour outage isn't just a single alert easy to miss or forget.
+func (c *WSFayeClient) maybeLogSustainedDegradation() {
+	c.connStateMu.Lock()
+	downFor := time.Since(c.lastConnected)
+	shouldLog := downFor >= sustainedDegradationThreshold && time.Now().After(c.nextDegradedAt)
+	if shouldLog {
+		c.nextDegradedAt = time.Now().Add(degradedAlertRepeatInterval)
+	}
+	c.connStateMu.Unlock()
+	if shouldLog {
+		c.log.Error().Dur("down_for", downFor).
+			Msg("GroupMe push websocket has not reconnected in over 5 minutes; real-time delivery is degraded, falling back to REST polling (messages still arrive, delayed up to the poll interval)")
+	}
+}
+
 // connectAndRun dials one websocket connection, handshakes, resubscribes,
 // and runs the read/connect loops until either fails or the connection
 // drops. It always returns a non-nil error (Listen treats every return as
@@ -518,6 +587,7 @@ func (c *WSFayeClient) connectAndRun(ctx context.Context) error {
 		return fmt.Errorf("handshake: %w", err)
 	}
 	c.log.Info().Str("client_id", c.clientID).Msg("GroupMe push websocket handshake succeeded")
+	c.markConnected()
 
 	c.resubscribeAll(runCtx)
 
@@ -598,6 +668,7 @@ func (c *WSFayeClient) Listen() {
 	const maxBackoff = 60 * time.Second
 	for {
 		err := c.connectAndRun(context.Background())
+		c.maybeLogSustainedDegradation()
 		c.log.Warn().Err(err).Dur("retry_in", backoff).Msg("GroupMe push websocket disconnected, reconnecting")
 		time.Sleep(backoff)
 		backoff *= 2
