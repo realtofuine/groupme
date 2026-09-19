@@ -142,24 +142,60 @@ func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent 
 	return cm, nil
 }
 
-// HandleLike is called when GroupMe reports the list of users who have
-// liked a message changed. GroupMe doesn't tell us who added/removed a
-// like, just the resulting FavoritedBy list, so this is bridged as a full
-// reaction resync for the message.
+// HandleLike is called when GroupMe reports that a message's reactions
+// changed. GroupMe doesn't tell us who added/removed which reaction, just
+// the resulting state, so this is bridged as a full reaction resync for
+// the message.
+//
+// GroupMe now supports full per-emoji reactions (confirmed live against
+// the real API: msg.Reactions is a list of {emoji code, user_ids} pairs,
+// e.g. a "\U0001F44D" (👍) entry with its own reactor list, separate from
+// any "❤️" (❤️) entry on the same message). msg.Reactions is a
+// local addition to the pinned groupme-lib dependency, which predates this
+// GroupMe feature entirely -- see thirdparty/groupme-lib/json.go.
+// FavoritedBy (the older, single-undifferentiated-like field) is kept only
+// as a fallback for payloads that might not carry the newer field (e.g.
+// possibly some live-push payload shapes, unverified) so a like is never
+// silently dropped -- but it can only ever be represented as a generic ❤,
+// since it doesn't say which emoji was actually used.
 func (gc *GMClient) HandleLike(msg groupme.Message) {
 	portalKey := gc.portalKeyForMessage(&msg)
-	users := make(map[networkid.UserID]*bridgev2.ReactionSyncUser, len(msg.FavoritedBy))
-	for _, userIDStr := range msg.FavoritedBy {
-		uid := MakeUserID(groupme.ID(userIDStr))
-		users[uid] = &bridgev2.ReactionSyncUser{
-			HasAllReactions: true,
-			Reactions: []*bridgev2.BackfillReaction{{
-				Sender: bridgev2.EventSender{
-					IsFromMe: groupme.ID(userIDStr) == groupme.ID(gc.Meta.GMID),
-					Sender:   uid,
-				},
-				Emoji: "❤",
-			}},
+	users := make(map[networkid.UserID]*bridgev2.ReactionSyncUser)
+
+	if len(msg.Reactions) > 0 {
+		for _, r := range msg.Reactions {
+			if r.Code == "" {
+				continue
+			}
+			for _, userIDStr := range r.UserIDs {
+				uid := MakeUserID(groupme.ID(userIDStr))
+				u, ok := users[uid]
+				if !ok {
+					u = &bridgev2.ReactionSyncUser{HasAllReactions: true}
+					users[uid] = u
+				}
+				u.Reactions = append(u.Reactions, &bridgev2.BackfillReaction{
+					Sender: bridgev2.EventSender{
+						IsFromMe: groupme.ID(userIDStr) == groupme.ID(gc.Meta.GMID),
+						Sender:   uid,
+					},
+					Emoji: r.Code,
+				})
+			}
+		}
+	} else {
+		for _, userIDStr := range msg.FavoritedBy {
+			uid := MakeUserID(groupme.ID(userIDStr))
+			users[uid] = &bridgev2.ReactionSyncUser{
+				HasAllReactions: true,
+				Reactions: []*bridgev2.BackfillReaction{{
+					Sender: bridgev2.EventSender{
+						IsFromMe: groupme.ID(userIDStr) == groupme.ID(gc.Meta.GMID),
+						Sender:   uid,
+					},
+					Emoji: "❤",
+				}},
+			}
 		}
 	}
 

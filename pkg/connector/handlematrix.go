@@ -31,12 +31,22 @@ import (
 
 var _ bridgev2.ReactionHandlingNetworkAPI = (*GMClient)(nil)
 
-// GroupMe only supports a single "like" per user per message, so we use a
-// fixed emoji ID and a max count of 1 to let the bridge de-duplicate.
+// GroupMe only supports a single reaction per user per message (reacting
+// again overwrites the previous one, confirmed in the community docs -- see
+// thirdparty/groupme-lib/likes_api.go), so MaxReactions is fixed at 1.
+// The emoji itself, however, is NOT fixed: GroupMe supports 15 specific
+// unicode reactions (groupme.UnicodeLikeIcons), not just a generic heart --
+// use whichever one the Matrix reaction actually used, falling back to the
+// heart only if it's not one GroupMe accepts (e.g. an arbitrary custom
+// Matrix emoji with no GroupMe equivalent).
 func (gc *GMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
+	emoji := msg.Content.RelatesTo.Key
+	if !groupme.UnicodeLikeIcons[emoji] {
+		emoji = "❤️"
+	}
 	return bridgev2.MatrixReactionPreResponse{
 		SenderID:     MakeUserID(groupme.ID(gc.Meta.GMID)),
-		Emoji:        "❤",
+		Emoji:        emoji,
 		MaxReactions: 1,
 	}, nil
 }
@@ -94,7 +104,11 @@ func (gc *GMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matr
 		conversationID = groupme.ID(gc.Meta.GMID)
 	}
 	messageID := ParseMessageID(msg.TargetMessage.ID)
-	err := gc.Client.CreateLike(ctx, conversationID, messageID)
+	var emoji string
+	if msg.PreHandleResp != nil {
+		emoji = msg.PreHandleResp.Emoji
+	}
+	err := gc.Client.CreateLike(ctx, conversationID, messageID, emoji)
 	if err != nil {
 		return nil, fmt.Errorf("failed to like GroupMe message: %w", err)
 	}

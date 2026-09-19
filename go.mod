@@ -45,3 +45,8 @@ require (
 // Local patch to force HTTP/1.1 for GroupMe's Faye/Bayeux push transport;
 // see thirdparty/wray/README.md.
 replace github.com/karmanyaahm/wray => ./thirdparty/wray
+
+// Local patch adding Message.Reactions (GroupMe's newer per-emoji reaction
+// data; not present in this library as pinned in 2022) and the Reaction
+// type. See thirdparty/groupme-lib/json.go.
+replace github.com/beeper/groupme-lib => ./thirdparty/groupme-lib
