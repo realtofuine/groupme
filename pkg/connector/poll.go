@@ -24,8 +24,6 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"maunium.net/go/mautrix/bridgev2/networkid"
-
 	"github.com/beeper/groupme-lib"
 )
 
@@ -46,12 +44,11 @@ import (
 //     calls used by the initial sync (gc.Client.IndexAllGroups /
 //     IndexAllChats, see sync.go) -- so newly created chats are picked up
 //     automatically, without needing a separately maintained chat list.
-//   - For each chat, "last seen message ID" is read back from bridgev2's
-//     own message store (DB.Message.GetLastNInPortal) instead of a new
-//     table: that store already records the most recently bridged message
-//     per portal (from either Faye or a previous poll) and survives
-//     restarts, so there's no new persistent state to invent or keep in
-//     sync.
+//   - For each chat, ONE request fetches the most recent page of messages
+//     (no since/after cursor -- see pollChat's doc comment for why this
+//     is both simpler and necessary to avoid rate limiting, not just an
+//     optimization); both new messages and reaction/like changes are
+//     bridged from that single response.
 //   - New messages are fed through GMClient.HandleTextMessage -- the exact
 //     same conversion path used for live Faye push messages -- so polled
 //     messages are bridged identically to pushed ones, including the
@@ -66,15 +63,34 @@ import (
 //     first wins and the other is a silent no-op.
 
 // defaultPollIntervalSeconds is used when the config doesn't specify one
-// (or specifies an invalid value). 20s is a reasonable default: GroupMe
-// doesn't aggressively rate-limit lightly-polled read endpoints for a
-// single personal account, but there's no reason to hammer it either.
-const defaultPollIntervalSeconds = 20
+// (or specifies an invalid value).
+//
+// Confirmed live that GroupMe's rate limiting is real, not theoretical:
+// with ~80 chats, a 20s interval, and even just one request per chat per
+// tick (~4 req/s sustained, all fired back-to-back at the top of each
+// tick), GroupMe returned "Error Code 429" on the majority of chats
+// within minutes (362 and 500 occurrences logged across two consecutive
+// runs). Disabling polling entirely immediately stopped all 429s (0
+// logged), confirming polling -- not resync/push traffic -- was the
+// cause. 60s cuts steady-state request rate 3x versus the previous
+// default; combined with staggering requests across the interval instead
+// of firing them all at once (pollOnce, below) and backing off
+// per-chat on an actual 429 (pollChat, below) rather than just retrying
+// on the next tick regardless, this is meant to stay well clear of
+// whatever GroupMe's actual limit is instead of just reducing how often
+// it gets hit.
+const defaultPollIntervalSeconds = 60
 
 // minPollIntervalSeconds is a floor on the configured interval, regardless
 // of what the config says, so a typo (e.g. "1" instead of "10") can't turn
 // this into a tight request loop against GroupMe's API.
-const minPollIntervalSeconds = 10
+const minPollIntervalSeconds = 30
+
+// pollBackoffDuration is how long a chat is skipped after it gets a 429,
+// before poll requests to it resume. Deliberately longer than the poll
+// interval itself so a rate-limited chat doesn't just get hit again on
+// the very next tick.
+const pollBackoffDuration = 3 * time.Minute
 
 // pollInterval returns the configured poll interval, clamped to a sane
 // minimum and defaulted if unset.
@@ -115,8 +131,26 @@ func (gc *GMClient) pollMessages(ctx context.Context) {
 	}
 }
 
+// pollTarget is one chat to poll in a pollOnce pass -- just enough to call
+// pollChat once the list is built and staggering can begin.
+type pollTarget struct {
+	chatID  groupme.ID
+	private bool
+}
+
 // pollOnce runs a single poll pass over every known group and DM chat.
+//
+// Requests are staggered evenly across (most of) the poll interval rather
+// than fired back-to-back -- confirmed live that GroupMe's rate limiting
+// reacts to bursty request patterns, not just total volume (see
+// defaultPollIntervalSeconds' doc comment). The stagger delay is computed
+// from the interval and chat count so total time spent here stays safely
+// within one tick even for an account with many chats, leaving headroom
+// for the requests themselves and per-chat backoff skips (which are
+// effectively free/instant).
 func (gc *GMClient) pollOnce(ctx context.Context, log zerolog.Logger) {
+	var targets []pollTarget
+
 	groups, err := gc.Client.IndexAllGroups()
 	if err != nil {
 		log.Err(err).Msg("Failed to list groups while polling for new messages")
@@ -125,7 +159,7 @@ func (gc *GMClient) pollOnce(ctx context.Context, log zerolog.Logger) {
 			if group == nil || len(group.ID) == 0 {
 				continue
 			}
-			gc.pollChat(ctx, log, gc.portalKeyForGroup(group.ID), group.ID, false)
+			targets = append(targets, pollTarget{chatID: group.ID, private: false})
 		}
 	}
 
@@ -141,103 +175,72 @@ func (gc *GMClient) pollOnce(ctx context.Context, log zerolog.Logger) {
 			if chat == nil || len(chat.OtherUser.ID) == 0 {
 				continue
 			}
-			gc.pollChat(ctx, log, gc.portalKeyForDM(chat.OtherUser.ID), chat.OtherUser.ID, true)
+			targets = append(targets, pollTarget{chatID: chat.OtherUser.ID, private: true})
 		}
 	}
-}
 
-// pollChat fetches and bridges any messages newer than the last one seen
-// for a single chat (group or DM). chatID is the GroupMe group ID for
-// groups, or the other participant's user ID for DMs.
-func (gc *GMClient) pollChat(ctx context.Context, log zerolog.Logger, portalKey networkid.PortalKey, chatID groupme.ID, private bool) {
-	last, err := gc.Main.br.DB.Message.GetLastNInPortal(ctx, portalKey, 1)
-	if err != nil {
-		log.Err(err).Str("chat_id", chatID.String()).Msg("Failed to look up last seen message ID for poll")
+	if len(targets) == 0 {
 		return
 	}
-	var sinceID groupme.ID
-	if len(last) > 0 {
-		sinceID = ParseMessageID(last[0].ID)
-	}
-	// If sinceID is empty (no message has ever been bridged for this chat,
-	// e.g. a portal created by initial sync that hasn't received anything
-	// since), GroupMe's list endpoints just return their default page of
-	// the most recent messages. That's not a real backfill implementation
-	// (see NOTES.md "Backfill"), but it's a harmless, bounded side effect
-	// that opportunistically gives a freshly created portal some recent
-	// history instead of starting completely silent.
 
-	var msgs []*groupme.Message
-	if private {
-		resp, err := gc.Client.IndexDirectMessages(ctx, chatID.String(), &groupme.IndexDirectMessagesQuery{SinceID: sinceID})
-		if err != nil {
-			logPollError(log, chatID, true, err)
+	// Spread requests across 80% of the interval, leaving the remaining
+	// 20% as headroom (request latency, GC pauses, etc.) so this pass
+	// reliably finishes before the next tick would fire (which, with a
+	// standard time.Ticker, would just be silently dropped if this run
+	// were still in progress -- fine for correctness, but defeats the
+	// point of staggering if it happened routinely).
+	delay := time.Duration(float64(gc.pollInterval()) * 0.8 / float64(len(targets)))
+
+	for i, t := range targets {
+		if ctx.Err() != nil {
 			return
 		}
-		msgs = resp.Messages
-	} else {
-		resp, err := gc.Client.IndexMessages(ctx, chatID, &groupme.IndexMessagesQuery{AfterID: sinceID, Limit: 20})
-		if err != nil {
-			logPollError(log, chatID, false, err)
-			return
-		}
-		msgs = resp.Messages
-	}
-
-	if len(msgs) > 0 {
-		// Both endpoints are documented to return results newest-first when
-		// no since/after cursor is given, and the DM endpoint's since_id
-		// behavior isn't documented as strictly ascending either (unlike
-		// the group endpoint's after_id, which is). Sort explicitly by
-		// timestamp so messages are always bridged in chronological order
-		// regardless of which case applies.
-		sort.SliceStable(msgs, func(i, j int) bool {
-			return msgs[i].CreatedAt.ToTime().Before(msgs[j].CreatedAt.ToTime())
-		})
-
-		for _, msg := range msgs {
-			if msg == nil || len(msg.ID) == 0 {
-				continue
+		gc.pollChat(ctx, log, t.chatID, t.private)
+		if i < len(targets)-1 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
 			}
-			// Same conversion path as live Faye push messages -- see
-			// handlegroupme.go. bridgev2 core dedupes by message ID before
-			// this does anything observable, so it's safe even if Faye
-			// also delivers this same message around the same time.
-			gc.HandleTextMessage(*msg)
 		}
 	}
-
-	// Reaction/like changes on already-seen messages: the since/after
-	// cursor fetch above only ever returns messages NEWER than the last
-	// one bridged, so a like added to an older message -- the normal case,
-	// since you react to something already sent -- is invisible to it.
-	// This must run unconditionally, NOT after the `len(msgs) == 0` guard
-	// below: "no new messages this tick" is the common case (a like on an
-	// existing message doesn't produce a new message), so gating this on
-	// that guard meant it silently never ran in exactly the case it exists
-	// for. Confirmed live: an app-added like sat unsynced indefinitely
-	// until this was moved above the guard.
-	// Live push (HandleLike, handlegroupme.go) is otherwise the only path
-	// that catches this, and it's been observed reconnecting roughly every
-	// 45 seconds (see NOTES.md "Faye/Bayeux push connection reliability"),
-	// so a like sent during one of those windows would otherwise never
-	// arrive at all. Independently re-fetch the most recent page (no
-	// cursor) every poll tick and resync reactions for each message via
-	// the same full-resync path HandleLike already uses live; this is a
-	// cheap, safe no-op when FavoritedBy hasn't changed.
-	gc.pollRecentReactions(ctx, log, chatID, private)
 }
 
-// pollRecentReactions re-fetches the most recent page of messages for a
-// chat (unconditionally, no since/after cursor) purely to catch
-// FavoritedBy (like) changes on messages already bridged -- see the call
-// site's comment in pollChat for why this is needed alongside the
-// cursor-based new-message fetch.
-func (gc *GMClient) pollRecentReactions(ctx context.Context, log zerolog.Logger, chatID groupme.ID, private bool) {
+// pollChat fetches the most recent page of messages for a single chat
+// (group or DM) and bridges both new messages and reaction/like changes
+// from that one response. chatID is the GroupMe group ID for groups, or
+// the other participant's user ID for DMs.
+//
+// This used to be two separate requests per chat per tick: one with a
+// since/after cursor for new messages, one uncursored for reaction
+// resyncing (see git history for the previous version and its reasoning).
+// Both are bounded to the same 20-message page GroupMe returns by default
+// (groupme.IndexMessagesQuery.Limit / the DM endpoint's fixed 20-per-page
+// behavior), so merging them loses no coverage -- and for "is this
+// message new", no cursor/local bookkeeping is needed at all:
+// HandleTextMessage's underlying bridgev2 core already dedupes incoming
+// messages by ID before doing anything observable
+// (Portal.handleRemoteMessage -> DB.Message.GetAllPartsByID), so simply
+// calling it for every message in the page unconditionally is already
+// correct and safe, not just an approximation.
+//
+// Confirmed live this was necessary, not just a theoretical optimization:
+// with ~80 chats and a 20s poll interval, two requests per chat per tick
+// was enough sustained request volume to trip GroupMe's rate limiting
+// (429s observed on the majority of chats within minutes of the
+// double-request version going live).
+func (gc *GMClient) pollChat(ctx context.Context, log zerolog.Logger, chatID groupme.ID, private bool) {
+	if until, skip := gc.checkPollBackoff(chatID); skip {
+		log.Debug().Str("chat_id", chatID.String()).Time("backoff_until", until).
+			Msg("Skipping poll for chat still backing off after a 429")
+		return
+	}
+
 	var msgs []*groupme.Message
 	if private {
 		resp, err := gc.Client.IndexDirectMessages(ctx, chatID.String(), &groupme.IndexDirectMessagesQuery{})
 		if err != nil {
+			gc.maybeBackoffPoll(chatID, err)
 			logPollError(log, chatID, true, err)
 			return
 		}
@@ -245,15 +248,42 @@ func (gc *GMClient) pollRecentReactions(ctx context.Context, log zerolog.Logger,
 	} else {
 		resp, err := gc.Client.IndexMessages(ctx, chatID, &groupme.IndexMessagesQuery{Limit: 20})
 		if err != nil {
+			gc.maybeBackoffPoll(chatID, err)
 			logPollError(log, chatID, false, err)
 			return
 		}
 		msgs = resp.Messages
 	}
+	if len(msgs) == 0 {
+		return
+	}
+
+	// Both endpoints are documented to return results newest-first when no
+	// since/after cursor is given, and the DM endpoint's ordering isn't
+	// documented as strictly one direction or the other either. Sort
+	// explicitly by timestamp so messages are always bridged in
+	// chronological order regardless of which case applies.
+	sort.SliceStable(msgs, func(i, j int) bool {
+		return msgs[i].CreatedAt.ToTime().Before(msgs[j].CreatedAt.ToTime())
+	})
+
 	for _, msg := range msgs {
 		if msg == nil || len(msg.ID) == 0 {
 			continue
 		}
+		// Same conversion path as live Faye push messages -- see
+		// handlegroupme.go. Safe to call unconditionally for every message
+		// in the page (not just ones newer than some cursor): bridgev2
+		// core dedupes by message ID before doing anything observable, so
+		// this is a no-op for anything already bridged, whether by a
+		// previous poll or by Faye push delivering it first.
+		gc.HandleTextMessage(*msg)
+		// Reaction/like resync for the same message. GroupMe's live push
+		// is the only other path that catches a like added to an
+		// already-bridged message, and it's not perfectly reliable (see
+		// "Faye/Bayeux push connection reliability" in NOTES.md) -- this
+		// is a cheap, safe no-op via the same full-resync HandleLike
+		// already uses live when FavoritedBy/Reactions haven't changed.
 		gc.HandleLike(*msg)
 	}
 }
@@ -264,9 +294,59 @@ func (gc *GMClient) pollRecentReactions(ctx context.Context, log zerolog.Logger,
 // instead of treating a normal empty poll as an error.
 func logPollError(log zerolog.Logger, chatID groupme.ID, private bool, err error) {
 	var meta *groupme.Meta
-	if errors.As(err, &meta) && meta.Code == groupme.HTTPNotModified {
-		log.Debug().Str("chat_id", chatID.String()).Bool("private", private).Msg("No new messages")
-		return
+	if errors.As(err, &meta) {
+		switch meta.Code {
+		case groupme.HTTPNotModified:
+			log.Debug().Str("chat_id", chatID.String()).Bool("private", private).Msg("No new messages")
+			return
+		case groupme.HTTPTooManyRequests, groupme.HTTPEnhanceYourCalm:
+			// Logged at WARN, not ERR: maybeBackoffPoll (below) already
+			// handles this by skipping the chat for a while, so a 429 here
+			// is an expected, self-mitigated condition, not a failure that
+			// needs attention the way an ERR-level log implies (including
+			// to the health-check alerting, which greps for ERR/FATAL).
+			log.Warn().Str("chat_id", chatID.String()).Bool("private", private).
+				Msg("Rate limited polling this chat, backing off")
+			return
+		}
 	}
 	log.Err(err).Str("chat_id", chatID.String()).Bool("private", private).Msg("Failed to poll for new messages")
+}
+
+// checkPollBackoff reports whether chatID is currently backing off after a
+// previous 429 (see maybeBackoffPoll), and if so, until when.
+func (gc *GMClient) checkPollBackoff(chatID groupme.ID) (until time.Time, skip bool) {
+	gc.pollBackoffMu.Lock()
+	defer gc.pollBackoffMu.Unlock()
+	if gc.pollBackoff == nil {
+		return time.Time{}, false
+	}
+	until, ok := gc.pollBackoff[chatID.String()]
+	if !ok || time.Now().After(until) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// maybeBackoffPoll records a backoff for chatID if err indicates GroupMe
+// rate-limited the request (429, or the older/undocumented-in-practice 420
+// "Enhance Your Calm" this library's original author expected instead --
+// handled the same way defensively, though only 429 has actually been
+// observed live). Polling for that chat is skipped for pollBackoffDuration
+// afterward (checkPollBackoff, above) instead of being retried on the very
+// next tick regardless.
+func (gc *GMClient) maybeBackoffPoll(chatID groupme.ID, err error) {
+	var meta *groupme.Meta
+	if !errors.As(err, &meta) {
+		return
+	}
+	if meta.Code != groupme.HTTPTooManyRequests && meta.Code != groupme.HTTPEnhanceYourCalm {
+		return
+	}
+	gc.pollBackoffMu.Lock()
+	defer gc.pollBackoffMu.Unlock()
+	if gc.pollBackoff == nil {
+		gc.pollBackoff = make(map[string]time.Time)
+	}
+	gc.pollBackoff[chatID.String()] = time.Now().Add(pollBackoffDuration)
 }

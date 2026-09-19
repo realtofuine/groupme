@@ -49,6 +49,15 @@ type GMClient struct {
 	// bridgev2's own reconnect logic.
 	pollMu     sync.Mutex
 	pollCancel context.CancelFunc
+
+	// pollBackoff tracks, per chat ID, when polling may resume after that
+	// chat got a 429 (rate limited) from GroupMe. See poll.go. Guarded by
+	// pollBackoffMu since multiple chats' polls can be in flight
+	// concurrently... actually they aren't (pollOnce is sequential/
+	// staggered, see poll.go), but the mutex costs nothing and removes any
+	// doubt if that ever changes.
+	pollBackoffMu sync.Mutex
+	pollBackoff   map[string]time.Time
 }
 
 var _ bridgev2.NetworkAPI = (*GMClient)(nil)
