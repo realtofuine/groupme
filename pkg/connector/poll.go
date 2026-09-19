@@ -183,29 +183,78 @@ func (gc *GMClient) pollChat(ctx context.Context, log zerolog.Logger, portalKey 
 		}
 		msgs = resp.Messages
 	}
-	if len(msgs) == 0 {
-		return
+
+	if len(msgs) > 0 {
+		// Both endpoints are documented to return results newest-first when
+		// no since/after cursor is given, and the DM endpoint's since_id
+		// behavior isn't documented as strictly ascending either (unlike
+		// the group endpoint's after_id, which is). Sort explicitly by
+		// timestamp so messages are always bridged in chronological order
+		// regardless of which case applies.
+		sort.SliceStable(msgs, func(i, j int) bool {
+			return msgs[i].CreatedAt.ToTime().Before(msgs[j].CreatedAt.ToTime())
+		})
+
+		for _, msg := range msgs {
+			if msg == nil || len(msg.ID) == 0 {
+				continue
+			}
+			// Same conversion path as live Faye push messages -- see
+			// handlegroupme.go. bridgev2 core dedupes by message ID before
+			// this does anything observable, so it's safe even if Faye
+			// also delivers this same message around the same time.
+			gc.HandleTextMessage(*msg)
+		}
 	}
 
-	// Both endpoints are documented to return results newest-first when no
-	// since/after cursor is given, and the DM endpoint's since_id behavior
-	// isn't documented as strictly ascending either (unlike the group
-	// endpoint's after_id, which is). Sort explicitly by timestamp so
-	// messages are always bridged in chronological order regardless of
-	// which case applies.
-	sort.SliceStable(msgs, func(i, j int) bool {
-		return msgs[i].CreatedAt.ToTime().Before(msgs[j].CreatedAt.ToTime())
-	})
+	// Reaction/like changes on already-seen messages: the since/after
+	// cursor fetch above only ever returns messages NEWER than the last
+	// one bridged, so a like added to an older message -- the normal case,
+	// since you react to something already sent -- is invisible to it.
+	// This must run unconditionally, NOT after the `len(msgs) == 0` guard
+	// below: "no new messages this tick" is the common case (a like on an
+	// existing message doesn't produce a new message), so gating this on
+	// that guard meant it silently never ran in exactly the case it exists
+	// for. Confirmed live: an app-added like sat unsynced indefinitely
+	// until this was moved above the guard.
+	// Live push (HandleLike, handlegroupme.go) is otherwise the only path
+	// that catches this, and it's been observed reconnecting roughly every
+	// 45 seconds (see NOTES.md "Faye/Bayeux push connection reliability"),
+	// so a like sent during one of those windows would otherwise never
+	// arrive at all. Independently re-fetch the most recent page (no
+	// cursor) every poll tick and resync reactions for each message via
+	// the same full-resync path HandleLike already uses live; this is a
+	// cheap, safe no-op when FavoritedBy hasn't changed.
+	gc.pollRecentReactions(ctx, log, chatID, private)
+}
 
+// pollRecentReactions re-fetches the most recent page of messages for a
+// chat (unconditionally, no since/after cursor) purely to catch
+// FavoritedBy (like) changes on messages already bridged -- see the call
+// site's comment in pollChat for why this is needed alongside the
+// cursor-based new-message fetch.
+func (gc *GMClient) pollRecentReactions(ctx context.Context, log zerolog.Logger, chatID groupme.ID, private bool) {
+	var msgs []*groupme.Message
+	if private {
+		resp, err := gc.Client.IndexDirectMessages(ctx, chatID.String(), &groupme.IndexDirectMessagesQuery{})
+		if err != nil {
+			logPollError(log, chatID, true, err)
+			return
+		}
+		msgs = resp.Messages
+	} else {
+		resp, err := gc.Client.IndexMessages(ctx, chatID, &groupme.IndexMessagesQuery{Limit: 20})
+		if err != nil {
+			logPollError(log, chatID, false, err)
+			return
+		}
+		msgs = resp.Messages
+	}
 	for _, msg := range msgs {
 		if msg == nil || len(msg.ID) == 0 {
 			continue
 		}
-		// Same conversion path as live Faye push messages -- see
-		// handlegroupme.go. bridgev2 core dedupes by message ID before
-		// this does anything observable, so it's safe even if Faye also
-		// delivers this same message around the same time.
-		gc.HandleTextMessage(*msg)
+		gc.HandleLike(*msg)
 	}
 }
 
