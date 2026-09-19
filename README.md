@@ -43,13 +43,25 @@ behind each fix.
   active chat with). Names also opportunistically refresh from message
   sender data, which additionally covers people who've since left a group.
 
+## Implemented but not yet verified live
+
+- **Outgoing images** (Matrix → GroupMe): downloads the Matrix media
+  (handles both encrypted and unencrypted rooms), uploads it to GroupMe's
+  separate image-upload host (`thirdparty/groupme-lib/image_service.go`,
+  a local addition — GroupMe's image service was never wired up in this
+  library at all), and attaches the result to the outgoing message. Builds
+  and deploys cleanly. **Deliberately not exercised with a real send** as
+  of this writing (the session that wrote it was explicitly asked to
+  implement without triggering a real message to real contacts) — next
+  session with the ability to send a real test image should verify this
+  end-to-end before trusting it. Outgoing video/file/location are still
+  not implemented.
+
 ## Known gaps
 
 - **No message history backfill.** New portals only show new activity
   going forward, plus an incidental one-page (~20 messages) dump from
   whatever the first poll happens to return — not a real backfill.
-- **No outgoing media** (images/files from Matrix → GroupMe). Never existed
-  in the pre-revival bridge either, not a regression.
 - **Incoming media limited to images.** Video/file/location attachments
   aren't ported yet (the old bridge had this in `handleAttachment`; visible
   in git history on the pre-revival commits for reference).

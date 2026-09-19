@@ -53,9 +53,10 @@ func (gc *GMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.M
 
 // HandleMatrixMessage bridges an outgoing Matrix message to GroupMe.
 //
-// Only plain text (and emote/notice) messages are supported for now; the
-// legacy bridge never implemented outgoing media either (see NOTES.md), so
-// this preserves the previous feature set while running on bridgev2.
+// Plain text (and emote/notice) messages, plus outgoing image attachments
+// (new -- the legacy bridge never implemented any outgoing media, see
+// NOTES.md). Other media types (video/file/location) are still not
+// supported outgoing, matching the previous feature set for those.
 func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	content := msg.Content
 	text := content.Body
@@ -68,6 +69,20 @@ func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 
 	portalType, gmid := ParsePortalID(msg.Portal.ID)
 	out := &groupme.Message{Text: text}
+
+	if content.MsgType == event.MsgImage {
+		attachment, err := gc.uploadMatrixImage(ctx, content)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload image to GroupMe: %w", err)
+		}
+		out.Attachments = []*groupme.Attachment{attachment}
+		// content.Body is the filename (e.g. "image.jpg"), not a caption --
+		// showing it as message text alongside the attachment would look
+		// wrong (a stray filename above the image), so an image with no
+		// separate caption gets no Text at all, matching how a plain image
+		// send looks in the native GroupMe app.
+		out.Text = ""
+	}
 
 	var sent *groupme.Message
 	var err error
@@ -94,6 +109,33 @@ func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 			Timestamp: time.UnixMilli(msg.Event.Timestamp),
 		},
 	}, nil
+}
+
+// uploadMatrixImage downloads an outgoing m.image event's media from Matrix
+// (handling both encrypted and unencrypted rooms via the same DownloadMedia
+// call -- content.File is nil for unencrypted media, in which case
+// DownloadMedia falls back to content.URL directly per its documented
+// contract) and re-uploads it to GroupMe's separate image-upload host
+// (thirdparty/groupme-lib/image_service.go, a local addition -- this
+// bridge never supported outgoing media at all before this, encrypted or
+// not), returning a ready-to-attach groupme.Attachment.
+func (gc *GMClient) uploadMatrixImage(ctx context.Context, content *event.MessageEventContent) (*groupme.Attachment, error) {
+	data, err := gc.Main.br.Bot.DownloadMedia(ctx, content.URL, content.File)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download image from Matrix: %w", err)
+	}
+
+	mimeType := ""
+	if content.Info != nil {
+		mimeType = content.Info.MimeType
+	}
+
+	url, err := gc.Client.UploadImage(ctx, data, mimeType)
+	if err != nil {
+		return nil, err
+	}
+
+	return &groupme.Attachment{Type: groupme.Image, URL: url}, nil
 }
 
 // HandleMatrixReaction bridges a Matrix reaction to a GroupMe "like".
