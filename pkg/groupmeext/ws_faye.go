@@ -408,17 +408,33 @@ func (c *WSFayeClient) connectLoop(ctx context.Context, conn *websocket.Conn) er
 		}
 		respCh := c.registerPending(id)
 
-		connCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		err := c.writeMessage(connCtx, conn, msg)
+		// Only the *send* is time-bounded -- Bayeux's /meta/connect is a
+		// long-hold by design (the server is meant to sit on it until
+		// there's something to report), and GroupMe's actual hold duration
+		// isn't documented, so there is no sane fixed deadline for "no
+		// response yet" that wouldn't eventually be too short. Waiting
+		// indefinitely for a *reply* isn't a bug: an unresponsive-forever
+		// connection is still detected, just via the independent
+		// websocket-level ping in connectAndRun (real transport liveness)
+		// and via readLoop's conn.Read erroring on an actually-dead
+		// connection, rather than by guessing how long GroupMe is allowed
+		// to take. Previously this used a 45s deadline on the wait itself
+		// and treated hitting it as fatal, tearing down and fully
+		// re-dialing/re-handshaking/re-subscribing the entire connection
+		// every time -- confirmed live to fire on a healthy connection
+		// roughly every 45 seconds, i.e. GroupMe routinely takes longer
+		// than 45s to respond to a connect and that's normal, not a
+		// failure.
+		sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := c.writeMessage(sendCtx, conn, msg)
+		cancel()
 		if err != nil {
-			cancel()
 			c.unregisterPending(id)
 			return fmt.Errorf("sending connect: %w", err)
 		}
 
 		select {
 		case resp := <-respCh:
-			cancel()
 			if resp.MsgAdvice != nil {
 				switch resp.MsgAdvice.Reconnect {
 				case "none":
@@ -430,10 +446,37 @@ func (c *WSFayeClient) connectLoop(ctx context.Context, conn *websocket.Conn) er
 			if !resp.Successful {
 				c.log.Warn().Str("error", resp.MsgError).Msg("GroupMe push connect was not successful")
 			}
-		case <-connCtx.Done():
-			cancel()
+		case <-ctx.Done():
 			c.unregisterPending(id)
-			return fmt.Errorf("connect timed out: %w", connCtx.Err())
+			return ctx.Err()
+		}
+	}
+}
+
+// pingLoop is the real liveness check for the connection: an active
+// websocket-protocol ping/pong on a fixed interval, independent of Bayeux
+// message traffic entirely. A ping failure (no pong within its own
+// timeout) is genuine evidence the transport is dead -- e.g. a "zombie"
+// connection that looks open but has silently stopped delivering anything,
+// which plain TCP doesn't always surface quickly on its own. This is what
+// should trigger a reconnect; a quiet /meta/connect (connectLoop, above)
+// should not.
+func (c *WSFayeClient) pingLoop(ctx context.Context, conn *websocket.Conn) error {
+	const interval = 30 * time.Second
+	const pingTimeout = 10 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("websocket ping failed: %w", err)
+			}
 		}
 	}
 }
@@ -481,11 +524,16 @@ func (c *WSFayeClient) connectAndRun(ctx context.Context) error {
 	connectErrCh := make(chan error, 1)
 	go func() { connectErrCh <- c.connectLoop(runCtx, conn) }()
 
+	pingErrCh := make(chan error, 1)
+	go func() { pingErrCh <- c.pingLoop(runCtx, conn) }()
+
 	select {
 	case err := <-readErrCh:
 		return fmt.Errorf("read loop: %w", err)
 	case err := <-connectErrCh:
 		return fmt.Errorf("connect loop: %w", err)
+	case err := <-pingErrCh:
+		return fmt.Errorf("ping loop: %w", err)
 	}
 }
 
