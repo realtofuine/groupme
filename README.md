@@ -1,7 +1,108 @@
 # Matrix GroupMe Go Bridge
-A Matrix-GroupMe puppeting bridge
 
-[Features & Roadmap](./ROADMAP.md)
+A Matrix–GroupMe puppeting bridge, built on [mautrix-go bridgev2](https://github.com/mautrix/go).
+
+**Status (2026-09-19): revived, deployed, and verified against a real GroupMe
+account and a real Matrix homeserver.** The upstream project
+(`karmanyaahm/matrix-groupme-go`, forked here as `beeper/groupme`) went
+unmaintained after March 2023 — the `revival-2026` branch (now `master`)
+ports it to the current bridgev2 framework and fixes several real bugs found
+by running it live. If you're picking this up cold, read this file first,
+then [NOTES.md](./NOTES.md) for the full technical history and reasoning
+behind each fix.
+
+## What's confirmed working (verified live, not just "should work")
+
+- **Login** via GroupMe access token (`dev.groupme.com` → Access Token).
+- **Initial sync**: on login, every existing group and DM gets a Matrix
+  room immediately (not just ones that happen to receive a new message).
+- **Incoming messages**, delivered two ways simultaneously:
+  - A **WebSocket** Bayeux connection (`wss://push.groupme.com/faye`) for
+    near-real-time push. Handshake succeeds, but the connection currently
+    cycles/reconnects roughly every 45 seconds rather than staying open
+    indefinitely — self-heals within ~2s each time, not investigated
+    further since the fallback below covers any gap.
+  - A **REST polling fallback** (~20s interval, configurable) that works
+    independently of the WebSocket, so message delivery doesn't depend on
+    push being healthy at all. If the WebSocket probe fails outright at
+    connect time, the bridge falls back to HTTP long-polling instead.
+- **Reactions**, both directions, with the **actual emoji** GroupMe
+  supports (❤️ 👍 🤣 🎉 🔥 😮 👀 😭 🥺 🙏 💀 🫶 🤬 💅 🫠) — not just a
+  generic heart. This required patching the vendored GroupMe API client
+  (see below): the pinned upstream library predates GroupMe's per-emoji
+  reactions feature and only exposed the older undifferentiated "like."
+  Seeing reactions is confirmed live end-to-end. Adding a reaction from
+  Matrix is code-complete and builds, using the same real emoji the user
+  picked in their client, but hasn't been separately confirmed live in
+  the Matrix→GroupMe direction (only GroupMe→Matrix was).
+- **Double puppeting**: your own messages/reactions show up attributed to
+  your real Matrix account, not a separate ghost, confirmed live.
+- **Member/room names**: resolved from the group's own membership list and
+  the account's chat list (not just the personal contacts/"relations"
+  list, which — confirmed live — doesn't include everyone you have an
+  active chat with). Names also opportunistically refresh from message
+  sender data, which additionally covers people who've since left a group.
+
+## Known gaps
+
+- **No message history backfill.** New portals only show new activity
+  going forward, plus an incidental one-page (~20 messages) dump from
+  whatever the first poll happens to return — not a real backfill.
+- **No outgoing media** (images/files from Matrix → GroupMe). Never existed
+  in the pre-revival bridge either, not a regression.
+- **Incoming media limited to images.** Video/file/location attachments
+  aren't ported yet (the old bridge had this in `handleAttachment`; visible
+  in git history on the pre-revival commits for reference).
+- **DM portal-key heuristic on the live-push path is unverified.** GroupMe's
+  DM `conversation_id` is actually a compound `"<id1>+<id2>"` string; the
+  current live-push handler's heuristic for picking the DM portal doesn't
+  replicate the old bridge's proper parsing of that. The *initial sync*
+  path doesn't have this problem (it gets the other user's ID directly from
+  the chat list), so this is a narrower edge case than it sounds — but
+  worth fixing if a DM ever routes to the wrong room.
+- **Custom per-group "like icon" isn't read.** If a group has swapped its
+  default like icon for something outside GroupMe's standard 15-emoji set,
+  reactions in that specific group will fall back to ❤️ instead of the
+  real custom icon.
+- No provisioning API, no space-room support tested, no
+  metrics/analytics — all low priority for a personal bridge.
+
+## Architecture quick reference
+
+- Go, bridgev2 (`maunium.net/go/mautrix/bridgev2`), same framework as
+  `mautrix/whatsapp`, `mautrix/gmessages`, etc. — those are good reference
+  implementations if you need a pattern for something not yet ported here.
+- `pkg/connector/` is the bridge implementation. `pkg/groupmeext/` wraps
+  the GroupMe API client and push transports.
+- **Two local vendor patches**, both via `go.mod` `replace` directives
+  (real upstream forks weren't possible to publish from the environment
+  that wrote them — consider upstreaming for real if these prove out):
+  - `thirdparty/wray/` — patches `github.com/karmanyaahm/wray` (the HTTP
+    long-polling Bayeux client) to force HTTP/1.1, working around a
+    hang/504 against `push.groupme.com` over HTTP/2.
+  - `thirdparty/groupme-lib/` — patches `github.com/beeper/groupme-lib`
+    (archived upstream, last commit Oct 2022) to add `Message.Reactions`
+    (GroupMe's newer per-emoji reaction data, absent from the pinned
+    version) and give `CreateLike` an emoji parameter.
+- Config generation, registration, and Docker build follow standard
+  bridgev2 conventions: `./build.sh`, `-e`/`-g` flags, `Dockerfile` +
+  `docker-run.sh`. See [NOTES.md](./NOTES.md) for the exact deployment
+  pattern used in the live setup this was verified against (custom systemd
+  unit + isolated SQLite DB, since there's no upstream Ansible role for
+  this bridge).
+
+## For the next person/session picking this up
+
+1. Read [NOTES.md](./NOTES.md) for the detailed "why" behind each fix
+   above — it's a chronological log, most useful for understanding a
+   specific piece rather than as a first read.
+2. The "Known gaps" list above is the best starting point for what to work
+   on next. The DM portal-key heuristic and custom like-icon items are the
+   most likely to actually bite someone.
+3. If you find a new bug, fix it, verify it live if you can, and update
+   both this file's status sections and NOTES.md — that's what made this
+   revival tractable across multiple sessions instead of everyone
+   re-discovering the same things.
 
 ## Discussion
 Matrix room: [#groupme-go-bridge:malhotra.cc](https://matrix.to/#/#groupme-go-bridge:malhotra.cc)
@@ -9,3 +110,4 @@ Matrix room: [#groupme-go-bridge:malhotra.cc](https://matrix.to/#/#groupme-go-br
 ## Credits
 
 Forked from https://github.com/karmanyaahm/matrix-groupme-go which was archived.
+Revived and ported to bridgev2 starting 2026-09.
