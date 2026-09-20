@@ -646,3 +646,79 @@ forced/tested live — would need e.g. blocking outbound access to
 `push.groupme.com` temporarily to verify end-to-end, not done here since
 that would have disrupted real-time delivery unnecessarily for something
 already reasoned through carefully.
+
+## Incoming video/file/location attachments (2026-09-20)
+
+Closed the "Incoming media limited to images" known gap. Ported
+video/file/location handling from the pre-2023 bridge's `handleAttachment`
+(`portal.go` on `master`) into `convertGroupMeMessage`
+(`pkg/connector/handlegroupme.go`), which previously only handled the
+`image` attachment type and silently skipped everything else.
+
+`groupme.Attachment.Type` values, confirmed against the old bridge's own
+switch statement (the only place this was ever documented): `image`
+(already ported), `video`, `file`, `location`, plus `mentions`/`emoji`/
+`reply` which ride alongside `msg.Text` rather than needing their own
+message part — the new `default` case in the switch just skips those,
+same as it always implicitly did for anything unhandled.
+
+Per-type notes:
+- **video**: GroupMe's video CDN wants the account's access token as a
+  `token` *cookie*, not the `X-Access-Token` header every other GroupMe
+  API endpoint uses — this is exactly what the old bridge did, so it's
+  assumed correct, but wasn't independently re-derived or re-verified
+  against current GroupMe behavior.
+- **file**: a two-step API — POST to `file.groupme.com/v1/{groupID}/fileData`
+  for metadata (name, mime type), then POST to
+  `.../v1/{groupID}/files/{fileID}` for the actual bytes, both
+  authenticated via `X-Access-Token`. Group-only: GroupMe's file-sharing
+  feature has no DM equivalent, and the API is keyed by group ID (not
+  conversation ID), so `convertGroupMeMessage` skips a `file` attachment
+  on a DM (`msg.GroupID` empty) with a warning rather than guessing at an
+  ID that wouldn't work anyway.
+- **location**: pure formatting, no network call — parses `lat`/`lng`
+  into an `event.MsgLocation` with a `geo:` URI.
+
+`convertGroupMeMessage`'s signature gained a `token string` parameter
+(the account's own GroupMe access token, `gc.Meta.Token`) since video/file
+downloads need it and image downloads (a plain public GET) didn't
+previously need to pass anything like it through.
+
+**Real bug fixed along the way, not just a port**: the old bridge's
+`DownloadFile` (`pkg/groupmeext/message.go`) called `panic(err)` on any
+HTTP request failure — a transient network error fetching one file
+attachment would have taken down the *entire bridge process*, disconnecting
+every chat, not just failing that one message. Rewritten (along with
+`DownloadVideo`, for consistency) to return an error like every other
+attachment path already does, so a failed download now just skips that one
+message (logged as a warning) instead of crashing everything. Also dropped
+a dead line in the old code (`req.URL.Query().Add(...)`) that mutated a
+copy of the URL's query and was never actually applied to the request —
+a no-op even in the original, presumably vestigial from some earlier
+version of that endpoint's auth.
+
+**Verification, without sending anything to Matrix** (per explicit
+instruction): confirmed first, by reading `bridgev2/portal.go`'s
+`handleRemoteMessage`, that bridgev2 core dedupes incoming messages by ID
+*before* ever calling `ConvertMessageFunc` — meaning re-polling the
+account's existing (already-bridged) history can't be used to exercise
+this new code at all, and deploying it live is safe/inert for every
+existing chat, only taking effect on genuinely new incoming attachments
+going forward. To actually test it, wrote a small standalone Go program
+(not committed — lived briefly at `cmd/attachtest/`, deleted after use)
+that used `groupmeext`/`groupme-lib` directly to scan the real account's
+message history via GroupMe's REST API — entirely independent of
+bridgev2/Matrix, a pure read — for any existing video/file/location
+attachments, and ran the new download functions against any found:
+
+- Found one real `file` attachment (a PDF in an existing group) and
+  successfully downloaded it via the new `DownloadFile` — 125277 bytes,
+  correct filename ("BEAR 26.pdf") and mime type (`application/pdf`)
+  recovered from GroupMe's own metadata endpoint. This path is now
+  confirmed working end-to-end against production data.
+- Scanned 28 groups' most recent 100 messages each and all 53 DMs' full
+  history; found zero `video` or `location` attachments to test against.
+  Those two remain ported, code-reviewed, and building/deploying cleanly,
+  but **not independently live-verified** — worth confirming the next
+  time either type actually shows up in the account (or borrowing a test
+  account/group that has one).

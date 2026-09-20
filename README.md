@@ -65,6 +65,13 @@ behind each fix.
   outage continues. No message loss either way; this is purely about
   visibility into "real-time delivery has been down for a while." See
   NOTES.md "Sustained websocket-outage alerting."
+- **Incoming file attachments** (GroupMe → Matrix): confirmed live against
+  a real file already in the account's history (downloaded via GroupMe's
+  file.groupme.com API and re-uploaded to Matrix's media repo with the
+  correct filename/mime type recovered from GroupMe's own metadata).
+  Group-only, matching GroupMe's own file-sharing feature — a file
+  attachment somehow appearing on a DM is logged and skipped rather than
+  guessed at.
 
 ## Implemented but not yet verified live
 
@@ -79,15 +86,20 @@ behind each fix.
   session with the ability to send a real test image should verify this
   end-to-end before trusting it. Outgoing video/file/location are still
   not implemented.
+- **Incoming video and location attachments** (GroupMe → Matrix): ported
+  from the pre-2023 bridge and builds cleanly, but no example of either
+  existed in the account's scanned history to verify against live (unlike
+  file attachments, above, which were). Location is pure
+  parsing/formatting with no network call, so the risk there is low;
+  video downloads via a cookie-authenticated request to GroupMe's video
+  CDN that hasn't been exercised against the real service at all. Worth
+  confirming the next time either type actually shows up.
 
 ## Known gaps
 
 - **No message history backfill.** New portals only show new activity
   going forward, plus an incidental one-page (~20 messages) dump from
   whatever the first poll happens to return — not a real backfill.
-- **Incoming media limited to images.** Video/file/location attachments
-  aren't ported yet (the old bridge had this in `handleAttachment`; visible
-  in git history on the pre-revival commits for reference).
 - **DM portal-key heuristic on the live-push path is unverified.** GroupMe's
   DM `conversation_id` is actually a compound `"<id1>+<id2>"` string; the
   current live-push handler's heuristic for picking the DM portal doesn't
