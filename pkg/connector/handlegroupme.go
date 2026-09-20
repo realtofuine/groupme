@@ -53,15 +53,32 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 		Sender:   MakeUserID(msg.UserID),
 	}
 
-	// Every GroupMe message carries the sender's name/avatar as of when it
-	// was sent (msg.Name / msg.AvatarURL). GetChatInfo's group-member sync
-	// (chatinfo.go) only knows about *current* group members via their
-	// per-group nickname, so anyone who has since left a group -- or whose
-	// membership sync hasn't run yet -- would otherwise only ever get a
-	// raw-numeric-ID ghost name. Opportunistically refresh the ghost here
-	// too, on every message, as a second source that also covers former
-	// members. Best-effort and non-blocking: message delivery must not wait
-	// on this.
+	// Every GroupMe message carries the sender's name as of when it was
+	// sent (msg.Name), often also an avatar (msg.AvatarURL). GetChatInfo's
+	// group-member sync (chatinfo.go) only knows about *current* group
+	// members via their per-group nickname, so anyone who has since left a
+	// group -- or whose membership sync hasn't run yet -- would otherwise
+	// only ever get a raw-numeric-ID ghost name. Opportunistically refresh
+	// the ghost here too, on every message, as a second source that also
+	// covers former members. Best-effort and non-blocking: message
+	// delivery must not wait on this.
+	//
+	// msg.AvatarURL is only ever passed through when non-empty -- confirmed
+	// live that GroupMe does NOT reliably echo it on every message even for
+	// senders who do have a real profile picture set (a real account with a
+	// real avatar showed empty avatar_url on plenty of its own messages).
+	// Passing avatarFor("") unconditionally here caused a real production
+	// bug: avatarFor("") returns a Remove avatar, so a message with no
+	// avatar_url would erase the ghost's real avatar, which then got
+	// restored by the next message (or a GetChatInfo/GetUserInfo resync)
+	// that did carry a real URL -- a constant remove/restore flicker on
+	// every message from an active sender, observed live burning through
+	// Matrix API requests and re-uploading the same avatar image to the
+	// media repo over and over. UserInfo.Avatar left nil here means
+	// "don't touch the avatar" (see bridgev2 Ghost.UpdateInfo), which is
+	// the correct behavior when this specific message just didn't say --
+	// the real avatar sync stays driven by GetChatInfo/GetUserInfo, which
+	// have complete data.
 	if msg.Name != "" && msg.UserID != groupme.ID(gc.Meta.GMID) {
 		go func(gmid groupme.ID, name, avatarURL string) {
 			ctx := context.Background()
@@ -71,10 +88,11 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 					Msg("Failed to get ghost for opportunistic name refresh from message")
 				return
 			}
-			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
-				Name:   ptr.Ptr(name),
-				Avatar: avatarFor(avatarURL),
-			})
+			info := &bridgev2.UserInfo{Name: ptr.Ptr(name)}
+			if avatarURL != "" {
+				info.Avatar = avatarFor(avatarURL)
+			}
+			ghost.UpdateInfo(ctx, info)
 		}(msg.UserID, msg.Name, msg.AvatarURL)
 	}
 
