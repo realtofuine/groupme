@@ -1119,3 +1119,64 @@ ever meant "confirmed under the specific conditions tested," not
 opportunistic-refresh feature in particular had looked correct in
 isolated testing (a single message, a single ghost) and only broke under
 continuous real usage across many senders.
+
+## Live incident: avatar flicker/reupload storm, take two (2026-09-20)
+
+The fix above (only touch the avatar when a message actually has one)
+turned out to be necessary but **not sufficient** -- the user reported
+the same symptom continuing minutes later, and in a second room, an even
+more extreme case: a single DM ghost ("Dr. String") with *thousands* of
+accumulated "changed their name"/"changed their profile picture" events
+piled up in Element's room member history.
+
+The real, complete root cause: `HandleTextMessage`'s opportunistic ghost
+refresh runs for *every* message it's called with, and `poll.go` calls
+`HandleTextMessage` for every message in a chat's most recent page on
+*every poll tick* (60s by default) -- including messages that were
+already bridged ages ago. That's fine for the message-bridging side
+effect itself (bridgev2 core dedupes by message ID before doing anything
+observable, see "REST polling fallback" above), but the refresh
+goroutine ran as a *direct* side effect, before bridgev2 ever got a
+chance to dedupe anything -- no equivalent protection existed for it.
+
+Each message stores the sender's name/avatar as a snapshot from whenever
+it was actually sent. A chat's most recent ~20 messages can easily span
+a real nickname or avatar change that already happened. Confirmed live:
+replaying that same page every poll tick flipped an active sender's
+ghost back and forth between the old and new name/avatar, once per
+message per tick, forever, for as long as the bridge ran -- growing
+without bound, not a one-off glitch. The first fix (empty-avatar-URL
+check) only prevented one specific *symptom* of this (erasing the
+avatar entirely); the underlying replay-driven flip-flopping remained,
+now potentially flipping between two different *real* avatar URLs (or
+two different real names) instead of real-vs-removed.
+
+**Fix**: a straightforward per-sender cooldown
+(`GMClient.ghostRefreshedAt`/`shouldRefreshGhost`, `client.go`) -- the
+opportunistic refresh now runs at most once per sender per 10 minutes,
+full stop, regardless of how many messages (old or new, live-pushed or
+polled) reference them in that window. Deliberately a blunt cap rather
+than trying to precisely distinguish "genuinely new" from "replayed"
+inside `HandleTextMessage` itself, which would mean duplicating
+bridgev2 core's own dedup logic in a second place.
+
+**Verified live under real sustained traffic**, having learned from the
+first fix's insufficiently thorough spot-check: after deploying, watched
+the two specific ghosts the user had reported by GroupMe ID (75316972
+"Dr. String", 52061885 "Tristan Doan") across several poll cycles --
+206 genuinely new (non-duplicate) messages from those two senders were
+processed in the following ~5 minutes, with zero resulting
+avatar/displayname churn. Before this fix, the same two senders were
+producing new churn roughly every 60 seconds (matching the poll
+interval), indefinitely, regardless of message volume.
+
+**Lesson for next time, stated plainly**: the first fix was declared
+"confirmed live" after watching a clean 20-second window right after
+deploy. That was true as far as it went, but the actual bug had a
+~60-second period tied to the poll interval, and a single spot-check
+right after a restart mostly just observes the (unrelated, expected)
+startup `ChatResync` burst rather than the poll-driven path that was
+still broken. A real fix verification for anything poll-interval-shaped
+needs to span multiple poll cycles under real ongoing traffic, not a
+single quiet window -- exactly what both fixes in this document now
+did, but only the second one was checked that way from the start.

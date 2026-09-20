@@ -52,13 +52,16 @@ behind each fix.
 - **Member/room names**: resolved from the group's own membership list and
   the account's chat list (not just the personal contacts/"relations"
   list, which — confirmed live — doesn't include everyone you have an
-  active chat with). Names also opportunistically refresh from message
-  sender data, which additionally covers people who've since left a group.
-  Avatars used to opportunistically refresh from message data too, but
-  that caused a real live bug (continuous avatar remove/restore churn,
-  since not every message carries an avatar URL even for senders who have
-  one) — fixed to only touch the avatar when a message actually provides
-  one; see NOTES.md "Live incident: avatar flicker/reupload storm."
+  active chat with). Names and avatars also opportunistically refresh
+  from message sender data, which additionally covers people who've since
+  left a group. This caused two real live bugs, both now fixed and
+  verified under real sustained traffic: (1) a message without an
+  avatar URL was erasing the ghost's real avatar instead of leaving it
+  alone, and (2) REST polling replaying old messages every 60s tick could
+  flip a sender's name/avatar back and forth indefinitely if their recent
+  message history spanned a real change — fixed with a per-sender
+  10-minute cooldown on the refresh. See NOTES.md "Live incident: avatar
+  flicker/reupload storm" (both entries — the fix took two attempts).
 - **Health-check/alerting** (outside this repo, lives on the host at
   `/matrix/health-check/`): a systemd timer every 5 minutes checks that
   all Matrix-related services are up and greps recent logs for
