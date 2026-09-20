@@ -112,17 +112,23 @@ behind each fix.
   video/file attachments" for the full investigation.
   - **Video**: fully confirmed — GroupMe hands back a one-time SAS-signed
     Azure Blob Storage URL to upload to, then a permanent public URL to
-    reference. Verified end-to-end from Go.
-  - **File**: the upload itself is confirmed (content transfers correctly,
-    byte-for-byte), but the resulting file's name/mime type come back
-    empty from GroupMe's own metadata — several encodings were tried
-    without finding the right one (see NOTES.md). Doesn't block sending
-    a file, but it may show with a blank/generic name in the native
-    GroupMe app.
-  - Neither has been exercised with a real Matrix-triggered send yet
-    (same standing caveat as outgoing images/locations, above) — the
-    upload API itself is what was novel/risky here and that part is
-    independently verified; the bridgev2 plumbing around it is the same
+    reference. Verified end-to-end from Go; not yet confirmed via a real
+    Matrix-triggered send.
+  - **File**: **confirmed via a real Matrix-triggered send** — the first
+    version landed with no filename/mime type (GroupMe showed it
+    blank/generic), which turned out to need the filename passed as a
+    `?name=` query parameter specifically (nothing else tried had any
+    effect); GroupMe then derives the mime type itself from that
+    filename's extension server-side. Fixed and re-verified (a real PDF
+    upload came back with the correct filename, correct
+    `application/pdf` mime type, and byte-identical content). One
+    residual gap: GroupMe's own extension-to-mime lookup doesn't seem to
+    cover every extension (a plain `.txt` file came back with an empty
+    mime type despite a correct filename) -- common types like PDF are
+    confirmed fine, but an obscure extension might still show up mime-less
+    on GroupMe's side; nothing this bridge can do about that specifically
+    since it's GroupMe's own table, not something under this bridge's
+    control.
     pattern as the already-implemented image path.
 - **Incoming video and location attachments** (GroupMe → Matrix): ported
   from the pre-2023 bridge and builds cleanly, but no example of either

@@ -955,32 +955,66 @@ same as every other "verify without sending" test this session.
    an upload that actually takes a while.
 3. Attach as `{"type": "file", "file_id": "<id>"}`.
 
-**Known gap, not solved**: the file's `file_name`/`mime_type` come back
-empty from `DownloadFile`'s own metadata lookup afterward, no matter what
-was tried to set them:
+**Filename/mime gap: found and fixed (2026-09-20, follow-up).** The user
+tried a real outgoing file send after this landed and got exactly the
+predicted symptom -- GroupMe showed it with a blank/generic name (visible
+to the user as "everything shows up as txt"). Cracked it by testing many
+query parameter names directly against the live API (having already ruled
+out multipart, headers, and Content-Type in the original investigation
+below): `?name=<filename>` on the upload POST is the one that actually
+works -- confirmed live (`?name=test.txt` made `file_name` come back
+populated where nothing else had). mime_type turned out not to be a
+separate field to set at all: GroupMe derives it server-side from
+`name`'s extension (confirmed live -- `?name=real.pdf` produced
+`mime_type: "application/pdf"` with no mime information passed anywhere
+else in the request). `UploadFile` now takes a `filename` parameter and
+includes it as that query parameter; `uploadMatrixFile`
+(`pkg/connector/handlematrix.go`) passes `content.Body` (the real Matrix
+filename) through, where it previously wasn't passed at all.
+
+Re-verified the same way as everything else here: a real PDF uploaded via
+the fixed Go code came back with the correct filename, correct
+`application/pdf` mime type, and byte-identical content on download.
+
+One residual, apparently-GroupMe-side gap: a plain `.txt` file's mime_type
+still comes back empty even with a correct `name=test.txt` and an
+explicit `Content-Type: text/plain` header on the request -- GroupMe's own
+extension-to-mime lookup table (whatever it is) just doesn't seem to cover
+`.txt`, unlike `.pdf` which works cleanly. Not something this bridge can
+fix since it's server-side derivation, not something the request
+controls; flagging in case a pattern emerges across more extensions later
+(only `.pdf` and `.txt` have actually been tried).
+
+The original investigation below (multipart, headers, Content-Type all
+failing to set metadata) is kept for the record since it's what narrowed
+down what *didn't* work and made testing query parameter names next the
+obvious move -- don't repeat those dead ends if picking this up again.
+
+**Original investigation, before the `?name=` fix above**: the file's
+`file_name`/`mime_type` came back empty from `DownloadFile`'s own
+metadata lookup afterward, no matter what was tried to set them:
 - A `multipart/form-data` body with a `Content-Disposition: form-data;
   name="file"; filename="test.txt"` part (curl's `-F`, which should
   produce exactly this) -- the file's *content* didn't even transfer this
-  way (`file_size` came back 0), tried over both HTTP/2 and HTTP/1.1.
+  way (`file_size` came back 0), tried over both HTTP/2 and HTTP/1.1. A
+  full wire trace (`curl --trace-ascii`) confirmed the multipart body
+  curl generated was textbook-correct (proper boundary, proper
+  `Content-Disposition`/`Content-Type` per-part headers) -- this endpoint
+  appears to simply not parse multipart at all, possibly stripped at an
+  ingress/WAF layer (its responses show `server: istio-envoy`).
 - The raw-bytes POST (the one that does work for content) plus a
   `Content-Disposition` header on the request itself, several custom
   `X-*-File-Name`-style headers, and `file_name`/`mime_type` query
-  parameters on the URL -- content transferred correctly every time
-  (`file_size` matched), but the name/mime metadata stayed empty every
-  time regardless.
-This doesn't block sending a file (the bytes transfer and round-trip
-correctly; `DownloadFile` on the receiving end works fine against a file
-uploaded this way), but a real GroupMe client displaying that file may
-show a blank or generic name instead of the real one. Worth another look
-if the actual mechanism is ever found (a hidden multipart field name?
-a required field ordering the server is picky about? something else
-entirely?) -- flagged here rather than spending more time guessing
-further given everything else about this investigation to get right.
+  parameters (snake_case) on the URL -- content transferred correctly
+  every time (`file_size` matched), but the name/mime metadata stayed
+  empty every time regardless. `name` (not `file_name`) was the one not
+  yet tried at this point -- see above.
 
-**Not exercised with a real Matrix-triggered send.** Both upload
-functions were independently verified live as described above (the novel,
-risky part), and `pkg/connector/handlematrix.go`'s wiring around them
-(`uploadMatrixVideo`/`uploadMatrixFile`) is structurally identical to the
-already-implemented, already-unexercised outgoing image path (download
-Matrix media, call the upload function, attach the result) -- same
-standing caveat as outgoing images/locations, not a new gap.
+**Not exercised with a real Matrix-triggered send: video only.** The file
+path *has* now been confirmed via a real Matrix-triggered send (see
+above) -- video has not; `uploadMatrixVideo`'s wiring in
+`pkg/connector/handlematrix.go` is structurally identical to the
+already-implemented outgoing image path (download Matrix media, call the
+upload function, attach the result), and the upload API itself (the
+novel, risky part) is independently verified live, but a real end-to-end
+video send from Matrix hasn't been tried yet.
