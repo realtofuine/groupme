@@ -72,6 +72,16 @@ behind each fix.
   Group-only, matching GroupMe's own file-sharing feature — a file
   attachment somehow appearing on a DM is logged and skipped rather than
   guessed at.
+- **Polls** (GroupMe → Matrix, read-only): a poll being created shows the
+  actual question and options (fetched live from GroupMe's undocumented
+  poll API, reverse-engineered against a real account — see NOTES.md), a
+  poll ending shows the final vote tally, and the "about to expire"
+  reminder is passed through. Deliberately one-way and plain-text, not
+  Matrix's native interactive poll widget — see NOTES.md "GroupMe polls"
+  for why, and for the fact that video/location remain unverified but
+  polls' rendering *is* confirmed against real data (a live account poll
+  plus historical finished-poll data, run through the conversion code
+  directly without touching Matrix).
 
 ## Implemented but not yet verified live
 

@@ -722,3 +722,92 @@ attachments, and ran the new download functions against any found:
   but **not independently live-verified** — worth confirming the next
   time either type actually shows up in the account (or borrowing a test
   account/group that has one).
+
+## GroupMe polls (2026-09-20)
+
+Prompted by the user creating a real test poll and noticing it only
+bridged as GroupMe's bare system text ("Created new poll 'test'"), no
+options visible from Matrix.
+
+GroupMe's polls feature (and its API) postdates the pinned groupme-lib
+entirely — no `Attachment`/`Message` field for it existed, and it isn't
+covered anywhere on dev.groupme.com's v3 docs. Reverse-engineered the real
+wire format directly against the live account (read-only REST calls, no
+polls created/voted on/modified in the process):
+
+- A poll's lifecycle produces messages carrying a top-level `event` field,
+  not previously modeled at all — added as `Event`/`PollEventData`/
+  `PollEventOption`/`PollEventEntity` in `thirdparty/groupme-lib/json.go`.
+  Three `event.type` values observed live:
+  - `poll.created`: a normal message from the creating user, `text:
+    "Created new poll 'X'"`, an `attachments: [{type: "poll", poll_id}]`
+    entry (new `Poll` attachmentType constant — the ID alone isn't enough
+    to render anything, the real content is in `event`), and
+    `event.data` carrying just the poll's `id`/`subject` plus the
+    creating user's id/nickname. Getting the actual question's options
+    requires a separate call.
+  - `poll.reminder`: a system message (`sender_type: "system"`, `text:
+    "Poll 'X' is about to expire"`), `event.data.poll` additionally
+    carries `expiration` (unix timestamp).
+  - `poll.finished`: a system message (`text: "Poll 'X' has expired"`),
+    `event.data.options` carries the final tally directly — each option's
+    `title`, `votes` count, and (unconfirmed for a non-anonymous poll,
+    every poll observed live was anonymous) possibly `voter_ids`. No
+    extra API call needed for this one; the finished message already has
+    everything.
+- To get an in-progress poll's actual question/options (`poll.created`
+  alone isn't enough), added `Client.GetPoll(ctx, conversationID,
+  pollID)` (new `thirdparty/groupme-lib/poll_api.go`), hitting `GET
+  /poll/{conversationID}/{pollID}` — also undocumented, reverse-engineered
+  against a real live poll. Confirmed fields: `subject`, `options`
+  (`id`/`title` pairs), `status` ("active" confirmed; a finished poll's
+  own status wasn't checked since `poll.finished`'s embedded data already
+  covers that case), `type` ("single" confirmed; "multiple" for a
+  multi-select poll is expected from GroupMe's UI but not confirmed
+  against a real response), `visibility` ("anonymous" confirmed; a named
+  equivalent not confirmed), `expiration`.
+
+`convertGroupMePollEvent` (`pkg/connector/handlegroupme.go`) renders all
+three event types as a single readable text message part — the question
+and options for `poll.created` (fetched live via `GetPoll`, falling back
+to just the bare subject if that call fails so the message doesn't
+disappear entirely), the final vote-by-option tally for `poll.finished`,
+and a plain notice for `poll.reminder`. Hooked into
+`convertGroupMeMessage` before the normal attachment loop, since a poll
+message's real content lives in `Event`, not in its (sometimes absent,
+sometimes just-a-pointer) attachments.
+
+**Deliberately one-way and plain-text.** Matrix has a native interactive
+poll widget (MSC3381, e.g. rendered/votable in Element), which this does
+not use. Wiring that up for real two-way sync — a Matrix vote calling
+GroupMe's (unresearched) vote-casting endpoint, a GroupMe vote change
+updating the Matrix poll's live state, handling a poll closing from
+either side — would be a substantially larger feature than every other
+attachment type this bridge bridges (all one-way, GroupMe → Matrix only).
+Out of scope for now; the goal here was just making a poll's
+question/options/results legible from Matrix, matching what triggered
+this work.
+
+**Verified without creating, voting on, or otherwise modifying any real
+poll**: wrote a throwaway `go test` inside `pkg/connector/` (same pattern
+as the video/file/location verification above — written, run, and
+deleted, never committed) that called `convertGroupMePollEvent` directly
+with real payloads:
+- The user's actual still-active test poll (`GetPoll` really was called
+  live against it — a read, not a write) rendered as:
+  `📊 New poll: "test"` / `• 1` / `• 2` / (blank line) /
+  `Vote in the GroupMe app (anonymous voting). Closes Sep 20, 1:59 AM.`
+- A historical finished poll (fully self-contained fixture data, no
+  network call) rendered as:
+  `📊 Poll ended: "Are you available from 5:00 P.M. to 6:00 P.M. this
+  Saturday?"` / `• Yes — 47 votes` / `• No — 13 votes`
+- A historical reminder rendered as:
+  `📊 Poll "..." is about to close.`
+
+All three matched expectations on inspection. Deployed live; since
+bridgev2 dedupes by message ID before conversion runs (see "Incoming
+video/file/location attachments" above), this is inert for the
+already-bridged `poll.created` message from the user's test poll — it'll
+only render richly the next time a *new* poll event comes through (e.g.
+when that same test poll's `poll.finished` event eventually fires, since
+that message ID hasn't been seen yet).
