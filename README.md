@@ -94,8 +94,21 @@ behind each fix.
   of this writing (the session that wrote it was explicitly asked to
   implement without triggering a real message to real contacts) — next
   session with the ability to send a real test image should verify this
-  end-to-end before trusting it. Outgoing video/file/location are still
-  not implemented.
+  end-to-end before trusting it.
+- **Outgoing locations** (Matrix → GroupMe): no upload/API call needed
+  (unlike image) — just parses the outgoing event's geo URI into GroupMe's
+  location attachment shape. The parsing itself is confirmed correct
+  (a throwaway unit test covered a plain coordinate pair, one with an
+  accuracy suffix, one with an altitude component, and a malformed input),
+  but — same caveat as outgoing images — **not exercised with a real
+  send**, since that would mean sending a real message.
+- **Outgoing video and file are not implemented.** Unlike image (a
+  documented image-upload host) and location (no upload needed at all),
+  GroupMe doesn't publicly document an upload endpoint for either, and no
+  reliable community reference for one was found. See NOTES.md "Outgoing
+  video/file attachments" for what was checked — the likely next step is
+  a packet capture of the real GroupMe app sending one, which needs a
+  human with the app, not something this session could do alone.
 - **Incoming video and location attachments** (GroupMe → Matrix): ported
   from the pre-2023 bridge and builds cleanly, but no example of either
   existed in the account's scanned history to verify against live (unlike

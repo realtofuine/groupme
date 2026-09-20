@@ -811,3 +811,54 @@ already-bridged `poll.created` message from the user's test poll — it'll
 only render richly the next time a *new* poll event comes through (e.g.
 when that same test poll's `poll.finished` event eventually fires, since
 that message ID hasn't been seen yet).
+
+## Outgoing location, and outgoing video/file attachments (2026-09-20)
+
+Follow-up to "Outgoing image attachments" (see NOTES.md/git history):
+extended outgoing media to also cover `m.location`, and investigated (but
+did not implement) outgoing video/file.
+
+**Outgoing location** (`matrixLocationToAttachment`,
+`pkg/connector/handlematrix.go`): unlike image, no upload or API call is
+needed at all -- a GroupMe location attachment is just `{type: "location",
+lat, lng, name}` embedded directly in the outgoing message JSON, same as
+every other attachment field already sent via the existing
+`CreateMessage`/`CreateDirectMessage` calls. Parses the outgoing event's
+`content.GeoURI` (an RFC 5870 `geo:` URI), handling the RFC's optional
+altitude coordinate and `;u=<uncertainty>` suffix (GroupMe's format has no
+room for either, so anything past the first two coordinate fields is
+dropped) -- mirrors the parsing already done for the *incoming* direction
+in `handlegroupme.go`'s `convertGroupMeMessage`.
+
+Verified without sending anything: `matrixLocationToAttachment` is a pure
+function (no network or Matrix calls needed, unlike image), so it was
+exercised directly via a throwaway `go test` (written, run, deleted, never
+committed) covering: a plain `geo:lat,lng`, one with a `;u=` suffix, one
+with an altitude component, and a deliberately malformed URI expected to
+error. All four behaved correctly.
+
+**Outgoing video/file: investigated, not implemented.** Searched for a
+documented or community-reverse-engineered upload endpoint the way images
+have one (`thirdparty/groupme-lib/image_service.go`,
+`image.groupme.com/pictures`) and incoming video/file downloads do
+(`push`/`file.groupme.com`, see "Incoming video/file/location
+attachments" above) -- found nothing usable. GroupMe's official
+`dev.groupme.com` v3 docs don't cover it at all (same as polls), and
+unlike polls -- where the real wire format could be reverse-engineered
+by just *reading* real messages the account had already received -- there
+was no existing real outgoing video/file message in the account's history
+to learn an upload flow from (the incoming-side investigation for those
+types found zero examples of either in the account's own history either,
+see "Incoming video/file/location attachments" above). Web search turned
+up community acknowledgment that this is genuinely undocumented territory
+(e.g. an old GroupMe API support forum thread asking for video upload
+support that was never answered), not a known-but-unwritten-up endpoint.
+
+Deliberately didn't guess at an endpoint shape and ship something
+untested -- unlike everything else in this bridge, there was no real data
+point (a live account example, a documented API, or even a solid
+community write-up) to build against here, only speculation. The
+realistic next step, if this is wanted, is a packet capture of the actual
+GroupMe mobile app sending a real video or file attachment -- something
+that needs a human with the app and a device to do, not something
+achievable from this environment alone.
