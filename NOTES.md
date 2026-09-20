@@ -1063,3 +1063,59 @@ intervention was needed beyond fixing and redeploying the crash itself.
 Given the severity (an actual production crash loop, not a theoretical
 concern), this was found, fixed, deployed, and committed ahead of
 anything else in progress at the time.
+
+## Live incident: avatar flicker/reupload storm (2026-09-20)
+
+Another user-reported live bug, right after the crash-loop above: "it
+keeps refreshing profile images and now the numbers are crazy." Confirmed
+via logs -- `req_id` (the bridge's own Matrix API request counter, logged
+on every request) climbing by 100+ per minute from a continuous stream of
+`avatar_url` GET/PUT pairs across many different ghosts, each PUT setting
+a genuinely *new* `mxc://` URI rather than staying stable (i.e., not just
+noisy logging -- real, repeated re-uploads of media to the homeserver).
+
+Root cause: the opportunistic per-message ghost refresh added earlier
+this session (`HandleTextMessage`, `handlegroupme.go`) passed
+`msg.AvatarURL` through to `avatarFor()` unconditionally, including when
+empty -- and `avatarFor("")` returns a *Remove* avatar (see
+`chatinfo.go`). Checked real message history directly against the API:
+GroupMe does **not** reliably include `avatar_url` on every message, even
+for a sender who has a real profile picture set on their account (a real
+account showed empty `avatar_url` on the majority of its own recent
+messages, non-empty on others). So a message that happened not to carry
+`avatar_url` was erasing the ghost's real avatar every time, which then
+got restored by the next message that did carry one (or by an unrelated
+`GetChatInfo`/`GetUserInfo` resync) -- only to be erased again by the
+next avatar-url-less message. Under any sustained normal chat activity,
+this cycled continuously and forever, not as a one-off glitch.
+
+Fixed: `UserInfo.Avatar` is now only set when `msg.AvatarURL` is
+non-empty; otherwise left `nil`, which bridgev2's `Ghost.UpdateInfo`
+treats as "don't touch the avatar" (it only inspects `Avatar` when
+non-nil) rather than "remove it." The name refresh is unaffected --
+`msg.Name` doesn't have this sometimes-absent problem, confirmed against
+the same message sample (every message had a non-empty `name`).
+
+Checked `chatinfo.go`'s other `avatarFor()` call sites
+(`GetChatInfo`/`GetUserInfo`) for the same class of bug: those all use
+authoritative full-profile data (`ShowGroup`'s member list,
+`IndexAllChats`, `IndexRelations`, `MyUser`), where an empty URL
+genuinely does mean "this user has no avatar set" rather than "this
+particular API response just didn't include it" -- so those were left
+as-is, correctly.
+
+Verified live: deployed, then watched request logs specifically *after*
+the expected one-time startup resync (every restart re-syncs every
+group's full member list once, which legitimately produces a burst of
+avatar GET/PUT calls -- not a bug, and was correctly excluded from the
+comparison) -- confirmed zero `avatar_url` activity in a clean 20-second
+window post-settle, versus continuous churn beforehand.
+
+Both this and the crash-loop above were found by directly investigating
+a live user complaint about broken behavior, not proactive testing --
+worth remembering that "confirmed live" earlier in this document only
+ever meant "confirmed under the specific conditions tested," not
+"exhaustively stress-tested under real sustained traffic." The
+opportunistic-refresh feature in particular had looked correct in
+isolated testing (a single message, a single ghost) and only broke under
+continuous real usage across many senders.

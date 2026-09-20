@@ -54,6 +54,11 @@ behind each fix.
   list, which — confirmed live — doesn't include everyone you have an
   active chat with). Names also opportunistically refresh from message
   sender data, which additionally covers people who've since left a group.
+  Avatars used to opportunistically refresh from message data too, but
+  that caused a real live bug (continuous avatar remove/restore churn,
+  since not every message carries an avatar URL even for senders who have
+  one) — fixed to only touch the avatar when a message actually provides
+  one; see NOTES.md "Live incident: avatar flicker/reupload storm."
 - **Health-check/alerting** (outside this repo, lives on the host at
   `/matrix/health-check/`): a systemd timer every 5 minutes checks that
   all Matrix-related services are up and greps recent logs for
