@@ -19,6 +19,8 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -53,10 +55,15 @@ func (gc *GMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.M
 
 // HandleMatrixMessage bridges an outgoing Matrix message to GroupMe.
 //
-// Plain text (and emote/notice) messages, plus outgoing image attachments
-// (new -- the legacy bridge never implemented any outgoing media, see
-// NOTES.md). Other media types (video/file/location) are still not
-// supported outgoing, matching the previous feature set for those.
+// Plain text (and emote/notice) messages, plus outgoing image and location
+// attachments (new -- the legacy bridge never implemented any outgoing
+// media at all, see NOTES.md). Video and file are still not supported
+// outgoing: unlike images (a documented, confirmed image-upload host) and
+// location (no upload needed at all, just lat/lng in the message JSON),
+// GroupMe doesn't publicly document an upload endpoint for either, and
+// none was found on investigation -- see NOTES.md "Outgoing video/file
+// attachments" for what was checked and why this wasn't guessed at
+// blind.
 func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	content := msg.Content
 	text := content.Body
@@ -70,7 +77,8 @@ func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 	portalType, gmid := ParsePortalID(msg.Portal.ID)
 	out := &groupme.Message{Text: text}
 
-	if content.MsgType == event.MsgImage {
+	switch content.MsgType {
+	case event.MsgImage:
 		attachment, err := gc.uploadMatrixImage(ctx, content)
 		if err != nil {
 			return nil, fmt.Errorf("failed to upload image to GroupMe: %w", err)
@@ -81,6 +89,19 @@ func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 		// wrong (a stray filename above the image), so an image with no
 		// separate caption gets no Text at all, matching how a plain image
 		// send looks in the native GroupMe app.
+		out.Text = ""
+
+	case event.MsgLocation:
+		attachment, err := matrixLocationToAttachment(content)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert Matrix location for GroupMe: %w", err)
+		}
+		out.Attachments = []*groupme.Attachment{attachment}
+		// Same reasoning as image, above: content.Body for a Matrix
+		// location is typically a generic client-generated description
+		// (e.g. "User location"), not meaningful text worth showing
+		// alongside the pin -- the attachment's own Name already carries
+		// whatever description was given (see matrixLocationToAttachment).
 		out.Text = ""
 	}
 
@@ -136,6 +157,47 @@ func (gc *GMClient) uploadMatrixImage(ctx context.Context, content *event.Messag
 	}
 
 	return &groupme.Attachment{Type: groupme.Image, URL: url}, nil
+}
+
+// matrixLocationToAttachment converts an outgoing m.location event's
+// content.GeoURI (an RFC 5870 "geo:" URI, e.g.
+// "geo:37.786971,-122.399677;u=35") into a GroupMe location attachment.
+// No upload/API call needed, unlike image (or the still-unimplemented
+// video/file) -- a GroupMe location is just lat/lng and a name embedded
+// directly in the message JSON (see the incoming path's equivalent
+// parsing in handlegroupme.go's convertGroupMeMessage, which this
+// mirrors).
+func matrixLocationToAttachment(content *event.MessageEventContent) (*groupme.Attachment, error) {
+	geo := strings.TrimPrefix(content.GeoURI, "geo:")
+	// RFC 5870 allows an optional altitude (three comma-separated
+	// coordinates instead of two) and a ";u=<uncertainty>" parameter
+	// suffix; GroupMe only has room for lat/lng, so anything past the
+	// first two coordinate fields is dropped.
+	geo = strings.SplitN(geo, ";", 2)[0]
+	parts := strings.SplitN(geo, ",", 3)
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("malformed geo URI %q", content.GeoURI)
+	}
+	lat, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid latitude in geo URI %q: %w", content.GeoURI, err)
+	}
+	lng, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid longitude in geo URI %q: %w", content.GeoURI, err)
+	}
+
+	name := content.Body
+	if name == "" {
+		name = "Location"
+	}
+
+	return &groupme.Attachment{
+		Type:      groupme.Location,
+		Latitude:  strconv.FormatFloat(lat, 'f', -1, 64),
+		Longitude: strconv.FormatFloat(lng, 'f', -1, 64),
+		Name:      name,
+	}, nil
 }
 
 // HandleMatrixReaction bridges a Matrix reaction to a GroupMe "like".
