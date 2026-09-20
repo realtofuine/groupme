@@ -251,6 +251,11 @@ func videoExtension(content *event.MessageEventContent, mimeType string) string 
 // generic portal/conversation ID) since GroupMe's file API is
 // group-scoped -- see UploadFile's doc comment; callers must only reach
 // this for a group portal (checked in HandleMatrixMessage).
+//
+// content.Body -- the real Matrix filename -- is passed through as-is:
+// UploadFile's doc comment covers why this is the one thing that actually
+// determines both the stored filename *and* mime type (GroupMe derives
+// the latter from the former's extension) on GroupMe's side.
 func (gc *GMClient) uploadMatrixFile(ctx context.Context, content *event.MessageEventContent, groupID groupme.ID) (*groupme.Attachment, error) {
 	data, err := gc.Main.br.Bot.DownloadMedia(ctx, content.URL, content.File)
 	if err != nil {
@@ -262,7 +267,7 @@ func (gc *GMClient) uploadMatrixFile(ctx context.Context, content *event.Message
 		mimeType = content.Info.MimeType
 	}
 
-	fileID, err := groupmeext.UploadFile(ctx, groupID, gc.Meta.Token, data, mimeType)
+	fileID, err := groupmeext.UploadFile(ctx, groupID, gc.Meta.Token, content.Body, data, mimeType)
 	if err != nil {
 		return nil, err
 	}

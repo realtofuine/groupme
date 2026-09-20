@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/beeper/groupme-lib"
@@ -294,17 +295,25 @@ type fileUploadStatus struct {
 // Azure Blob Storage passthrough, so a plain X-Access-Token-authenticated
 // POST of the raw bytes is enough on its own.
 //
-// Known gap: the resulting file's name/mime type come back empty from
-// GroupMe's own metadata lookup (DownloadFile's fileData call) no matter
-// what was tried here (a multipart form body with a proper
-// Content-Disposition filename, custom headers, query parameters) --
-// the file's actual content transfers correctly (confirmed byte-for-byte
-// against a small real upload), so this isn't a functional blocker, but
-// a downstream GroupMe client may show it with a blank/generic name
-// instead of the real one. Worth revisiting if the exact mechanism GroupMe
-// expects is ever found.
-func UploadFile(ctx context.Context, groupID groupme.ID, token string, data []byte, mimeType string) (fileID string, err error) {
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://file.groupme.com/v1/%s/files", groupID), bytes.NewReader(data))
+// filename is passed as a "name" query parameter -- confirmed live to be
+// the *only* thing that makes DownloadFile's metadata lookup come back
+// populated afterward: neither a multipart form body (with a proper
+// Content-Disposition filename -- the content didn't even transfer that
+// way, this endpoint appears to not parse multipart at all), nor the
+// Content-Type header, nor several other header/query-param names tried,
+// had any effect. mime_type is then derived by GroupMe itself from
+// filename's extension (confirmed live: a ".pdf" name produced
+// "application/pdf" with no mime type passed anywhere else) -- so the
+// mimeType parameter here is honored only as this function's own
+// Content-Type request header (harmless either way, but not what
+// actually determines the stored mime_type); pass a real filename with
+// its real extension to get useful metadata out the other end.
+func UploadFile(ctx context.Context, groupID groupme.ID, token, filename string, data []byte, mimeType string) (fileID string, err error) {
+	uploadURL := fmt.Sprintf("https://file.groupme.com/v1/%s/files", groupID)
+	if filename != "" {
+		uploadURL += "?name=" + url.QueryEscape(filename)
+	}
+	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("failed to build file upload request: %w", err)
 	}
