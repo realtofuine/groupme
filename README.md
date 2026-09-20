@@ -102,13 +102,28 @@ behind each fix.
   accuracy suffix, one with an altitude component, and a malformed input),
   but — same caveat as outgoing images — **not exercised with a real
   send**, since that would mean sending a real message.
-- **Outgoing video and file are not implemented.** Unlike image (a
-  documented image-upload host) and location (no upload needed at all),
-  GroupMe doesn't publicly document an upload endpoint for either, and no
-  reliable community reference for one was found. See NOTES.md "Outgoing
-  video/file attachments" for what was checked — the likely next step is
-  a packet capture of the real GroupMe app sending one, which needs a
-  human with the app, not something this session could do alone.
+- **Outgoing video and file** (Matrix → GroupMe): GroupMe doesn't publicly
+  document an upload endpoint for either, so both were reverse-engineered
+  live — a packet-capture session against the real GroupMe web client
+  (sending real test attachments in the "Test" group), then independently
+  confirmed from this Go code directly against the live API, uploading a
+  real (orphaned, never attached to any message) test video and file and
+  reading each one back byte-for-byte identical. See NOTES.md "Outgoing
+  video/file attachments" for the full investigation.
+  - **Video**: fully confirmed — GroupMe hands back a one-time SAS-signed
+    Azure Blob Storage URL to upload to, then a permanent public URL to
+    reference. Verified end-to-end from Go.
+  - **File**: the upload itself is confirmed (content transfers correctly,
+    byte-for-byte), but the resulting file's name/mime type come back
+    empty from GroupMe's own metadata — several encodings were tried
+    without finding the right one (see NOTES.md). Doesn't block sending
+    a file, but it may show with a blank/generic name in the native
+    GroupMe app.
+  - Neither has been exercised with a real Matrix-triggered send yet
+    (same standing caveat as outgoing images/locations, above) — the
+    upload API itself is what was novel/risky here and that part is
+    independently verified; the bridgev2 plumbing around it is the same
+    pattern as the already-implemented image path.
 - **Incoming video and location attachments** (GroupMe → Matrix): ported
   from the pre-2023 bridge and builds cleanly, but no example of either
   existed in the account's scanned history to verify against live (unlike

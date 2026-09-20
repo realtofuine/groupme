@@ -862,3 +862,125 @@ realistic next step, if this is wanted, is a packet capture of the actual
 GroupMe mobile app sending a real video or file attachment -- something
 that needs a human with the app and a device to do, not something
 achievable from this environment alone.
+
+## Outgoing video/file: cracked via live packet capture (2026-09-20)
+
+Follow-up to the above -- the user offered to actually do the packet
+capture. Turned out not to need a proxy/mobile setup at all: the user's
+Chrome browser was already connected to this session's browser-control
+tool, and GroupMe has a full web client (web.groupme.com) that supports
+both attachment types, so the capture happened entirely through that: a
+content script injected into the tab to hook `window.fetch` and
+`XMLHttpRequest.prototype.send`/`open` and log every GroupMe-bound
+request's URL/method/headers/body shape, then the user sent real test
+attachments (a PDF, then a video, then another file) in the account's own
+"Test" group while it was watching.
+
+**False starts, in order, because they matter for anyone repeating this:**
+- The very first "file" send didn't teach anything new -- it turned out to
+  be a re-share of an *existing* file already in the group's history, not
+  a fresh upload, so the network calls it produced (`file.groupme.com`'s
+  `fileData` metadata lookup, twice) were just the same read path
+  `DownloadFile` already used, not an upload at all.
+- For a genuinely new video, the capture caught `GET m.groupme.com/uploads`
+  immediately followed by `PUT cdn2.groupme.com/uploads/{id}/original.mov`
+  with an `x-ms-blob-type: BlockBlob` header (an Azure Blob Storage
+  tell) and a heavy SAS query string (`sig`, `se`, `sp`, etc). Tried
+  replicating the GET directly (from the same page, then externally) --
+  consistently 405'd no matter what headers/methods were tried. Also tried
+  skipping straight to a direct PUT with just GroupMe's own
+  `X-Access-Token` (no SAS) against a brand-new random ID -- Azure itself
+  correctly rejected this with a real `PublicAccessNotPermitted` error
+  (harmless: nothing was created, this just confirms Azure Blob Storage
+  doesn't accept unsigned writes, full stop). At this point it looked like
+  the actual SAS-issuing call must be happening through something
+  invisible to page-level JS interception (a Service Worker was the
+  leading theory -- both video and, on a later retest, file's real upload
+  call showed the same pattern: a multi-minute gap in the capture right
+  where the byte-upload must be happening).
+- Nearly gave up on both as "needs manual DevTools inspection or deeper
+  reverse engineering of GroupMe's client bundle" -- the latter felt like
+  it crossed from observing traffic (comparable to everything else
+  reverse-engineered this session: reactions, polls) into actively
+  decompiling their client code, which their API ToS explicitly
+  prohibits, and wasn't worth doing without the user's explicit sign-off.
+- The breakthrough was re-examining `file.groupme.com` specifically:
+  unlike `m.groupme.com`/`cdn2.groupme.com` (confirmed live to be a real
+  Azure Blob Storage passthrough, SAS-token gated), `file.groupme.com`'s
+  own response headers (`x-gm-service: file-service`,
+  `x-gm-service: authproxy-local`, `server: istio-envoy`) show it's
+  GroupMe's *own* backend microservice, not a storage passthrough --
+  so a plain authenticated write was worth trying directly rather than
+  assuming it needed the same SAS dance as video. It did NOT need a SAS
+  URL, and confirming that made it worth re-testing the "just guess a
+  simple endpoint" approach for `m.groupme.com/uploads` too, this time
+  reading its *validation error responses* instead of guessing headers --
+  which immediately revealed the real required JSON fields.
+
+**Video** (`groupmeext.UploadVideo`, `pkg/groupmeext/message.go`):
+1. `POST https://m.groupme.com/uploads`, JSON body
+   `{"FileSize": <bytes>, "SenderId": "<own user ID>", "Extension": "<ext, no dot>", "groupId": "<group ID>"}`
+   (or `"recipientId"` instead of `"groupId"` for a DM -- inferred from
+   the validation error's own wording, "You must provide either
+   recipientId or groupId", not separately tested against a real DM to
+   avoid disrupting a real contact's chat), `X-Access-Token` header.
+   The exact required fields were read directly off this endpoint's own
+   ASP.NET model-validation errors (e.g.
+   `{"errors":{"FileSize":["The FileSize field is required."]}}`) by
+   sending deliberately-incomplete requests and reading what it
+   complained about next, rather than guessing blind.
+   Response: `{"uploadUrl": "<SAS PUT URL>", "renderUrl": "<public playback URL>", "thumbnailUrl": "<public thumbnail URL>", "transcriptUrl": null}`.
+2. `PUT <uploadUrl>` with the raw video bytes, `Content-Type: <mime>`,
+   `x-ms-blob-type: BlockBlob`. No GroupMe auth needed on this request at
+   all -- the SAS signature in the URL is Azure's own auth mechanism.
+3. Attach as `{"type": "video", "url": renderUrl, "preview_url": thumbnailUrl}`.
+
+Verified fully from Go (not just replaying the browser's calls): created a
+real upload session, uploaded a real small test video's bytes, and
+confirmed `renderUrl` serves back content byte-for-byte identical to what
+was uploaded. This session/upload was never attached to any message, so
+it's an orphaned, harmless, invisible record in GroupMe's storage --
+same as every other "verify without sending" test this session.
+
+**File** (`groupmeext.UploadFile`, `pkg/groupmeext/message.go`):
+1. `POST https://file.groupme.com/v1/{groupID}/files` with the raw file
+   bytes as the body, `Content-Type: <mime>`, `X-Access-Token`. No
+   pre-declaration step needed (unlike video) -- this is GroupMe's own
+   service, not a storage passthrough.
+   Response: `{"status_url": "https://file.groupme.com/v1/{groupID}/uploadStatus?job=<id>"}`.
+2. Poll `GET <status_url>` (`X-Access-Token`) until
+   `{"status": "completed", "file_id": "<id>"}` -- every real upload
+   tried (small test files) completed on the very first poll, so
+   `UploadFile`'s retry loop (500ms × up to 20 attempts) is untested for
+   an upload that actually takes a while.
+3. Attach as `{"type": "file", "file_id": "<id>"}`.
+
+**Known gap, not solved**: the file's `file_name`/`mime_type` come back
+empty from `DownloadFile`'s own metadata lookup afterward, no matter what
+was tried to set them:
+- A `multipart/form-data` body with a `Content-Disposition: form-data;
+  name="file"; filename="test.txt"` part (curl's `-F`, which should
+  produce exactly this) -- the file's *content* didn't even transfer this
+  way (`file_size` came back 0), tried over both HTTP/2 and HTTP/1.1.
+- The raw-bytes POST (the one that does work for content) plus a
+  `Content-Disposition` header on the request itself, several custom
+  `X-*-File-Name`-style headers, and `file_name`/`mime_type` query
+  parameters on the URL -- content transferred correctly every time
+  (`file_size` matched), but the name/mime metadata stayed empty every
+  time regardless.
+This doesn't block sending a file (the bytes transfer and round-trip
+correctly; `DownloadFile` on the receiving end works fine against a file
+uploaded this way), but a real GroupMe client displaying that file may
+show a blank or generic name instead of the real one. Worth another look
+if the actual mechanism is ever found (a hidden multipart field name?
+a required field ordering the server is picky about? something else
+entirely?) -- flagged here rather than spending more time guessing
+further given everything else about this investigation to get right.
+
+**Not exercised with a real Matrix-triggered send.** Both upload
+functions were independently verified live as described above (the novel,
+risky part), and `pkg/connector/handlematrix.go`'s wiring around them
+(`uploadMatrixVideo`/`uploadMatrixFile`) is structurally identical to the
+already-implemented, already-unexercised outgoing image path (download
+Matrix media, call the upload function, attach the result) -- same
+standing caveat as outgoing images/locations, not a new gap.
