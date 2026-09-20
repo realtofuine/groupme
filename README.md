@@ -23,7 +23,12 @@ behind each fix.
     response as a dead connection; fixed (real WebSocket-level ping is now
     the actual liveness check instead) and verified live at 9+ minutes
     continuous, zero reconnects. See NOTES.md "WebSocket reconnect-cycle
-    fix" for details.
+    fix" for details. Also previously **crashed the entire bridge
+    process** on any push message type without a registered handler
+    (e.g. a typing indicator) — a real bug in the pinned upstream library
+    that crash-looped in production; fixed to skip unhandled types
+    instead of panicking. See NOTES.md "Live incident: crash loop on an
+    unhandled push message type."
   - A **REST polling fallback** (60s interval, configurable) that works
     independently of the WebSocket, so message delivery doesn't depend on
     push being healthy at all. If the WebSocket probe fails outright at

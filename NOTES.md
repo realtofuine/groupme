@@ -1018,3 +1018,48 @@ already-implemented outgoing image path (download Matrix media, call the
 upload function, attach the result), and the upload API itself (the
 novel, risky part) is independently verified live, but a real end-to-end
 video send from Matrix hasn't been tried yet.
+
+## Live incident: crash loop on an unhandled push message type (2026-09-20)
+
+While actively testing the above, the user reported messages had stopped
+bridging. Investigation (`sudo journalctl -u matrix-mautrix-groupme.service`)
+found the bridge process itself was crash-looping -- `systemctl status`
+showed `activating (auto-restart)`, and the log had the same panic
+repeating on every single restart attempt:
+
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0xb35a84]
+...
+	/build/thirdparty/groupme-lib/real_time.go:162 +0x224
+created by github.com/beeper/groupme-lib.(*PushSubscription).StartListening
+```
+
+Root cause: a genuine bug in the pinned upstream library (predates every
+change made this session), not anything introduced recently.
+`StartListening`'s push-message dispatch loop looked up a handler by
+message type in `RealTimeHandlers` and, on a miss, logged "Unable to
+handle GroupMe message type" but then **fell through** to call
+`handler(r, channel, content)` regardless -- with `handler` left `nil`
+from the failed map lookup. Only five message types are ever registered
+(`real_time_handler.go`: `direct_message.create`, `line.create`,
+`like.create`, `membership.create`, `favorite`) -- GroupMe pushes several
+other types over the same channel in ordinary use (typing indicators
+being the most common), so this was never a rare edge case once real,
+sustained traffic hit it; it just happened not to have been hit yet.
+Fixed in `thirdparty/groupme-lib/real_time.go` to `continue` on an
+unhandled type instead of falling through to the nil call -- matching
+what the surrounding early-exit checks (ping/empty-type/nil-content) were
+already clearly trying to do.
+
+Recovery was automatic once fixed and deployed: REST polling (already
+running independently, see "REST polling fallback" above) picked up
+every message sent during the outage on its next cycle after the fix
+landed -- confirmed by checking the 10 messages sent during the outage
+window directly against the `message` table, all present with a real
+`mxid` within about a minute of redeploying. No manual backfill or
+intervention was needed beyond fixing and redeploying the crash itself.
+
+Given the severity (an actual production crash loop, not a theoretical
+concern), this was found, fixed, deployed, and committed ahead of
+anything else in progress at the time.
