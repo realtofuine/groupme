@@ -46,6 +46,31 @@ func (gc *GMClient) HandleError(err error) {
 	gc.UserLogin.Log.Err(err).Msg("Error from GroupMe push subscription")
 }
 
+// ghostRefreshCooldown bounds how often HandleTextMessage's opportunistic
+// ghost name/avatar refresh (below) can actually run for a given sender,
+// regardless of how many messages mention them. See shouldRefreshGhost
+// and the call site's doc comment for why this exists -- in short,
+// without it, REST polling replaying old messages every tick could flip
+// a ghost's name/avatar back and forth forever.
+const ghostRefreshCooldown = 10 * time.Minute
+
+// shouldRefreshGhost reports whether HandleTextMessage's opportunistic
+// ghost refresh should actually run for gmid right now, and if so records
+// that it did. Callers should treat a false return as "skip this time",
+// not an error.
+func (gc *GMClient) shouldRefreshGhost(gmid groupme.ID) bool {
+	gc.ghostRefreshMu.Lock()
+	defer gc.ghostRefreshMu.Unlock()
+	if gc.ghostRefreshedAt == nil {
+		gc.ghostRefreshedAt = make(map[string]time.Time)
+	}
+	if last, ok := gc.ghostRefreshedAt[gmid.String()]; ok && time.Since(last) < ghostRefreshCooldown {
+		return false
+	}
+	gc.ghostRefreshedAt[gmid.String()] = time.Now()
+	return true
+}
+
 func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 	portalKey := gc.portalKeyForMessage(&msg)
 	sender := bridgev2.EventSender{
@@ -63,23 +88,33 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 	// covers former members. Best-effort and non-blocking: message
 	// delivery must not wait on this.
 	//
-	// msg.AvatarURL is only ever passed through when non-empty -- confirmed
-	// live that GroupMe does NOT reliably echo it on every message even for
-	// senders who do have a real profile picture set (a real account with a
-	// real avatar showed empty avatar_url on plenty of its own messages).
-	// Passing avatarFor("") unconditionally here caused a real production
-	// bug: avatarFor("") returns a Remove avatar, so a message with no
-	// avatar_url would erase the ghost's real avatar, which then got
-	// restored by the next message (or a GetChatInfo/GetUserInfo resync)
-	// that did carry a real URL -- a constant remove/restore flicker on
-	// every message from an active sender, observed live burning through
-	// Matrix API requests and re-uploading the same avatar image to the
-	// media repo over and over. UserInfo.Avatar left nil here means
-	// "don't touch the avatar" (see bridgev2 Ghost.UpdateInfo), which is
-	// the correct behavior when this specific message just didn't say --
-	// the real avatar sync stays driven by GetChatInfo/GetUserInfo, which
-	// have complete data.
-	if msg.Name != "" && msg.UserID != groupme.ID(gc.Meta.GMID) {
+	// Two real production bugs found in this one feature, both from the
+	// same underlying mistake -- treating "a message mentions this sender"
+	// as if it meant "this is fresh, current info about this sender",
+	// when a message is really a snapshot from whenever it was *sent*,
+	// and this function runs for every message polling re-fetches every
+	// tick (poll.go), not just genuinely new ones:
+	//
+	//  1. msg.AvatarURL is only ever passed through when non-empty --
+	//     confirmed live that GroupMe does NOT reliably echo it on every
+	//     message even for senders who do have a real profile picture set.
+	//     Passing avatarFor("") unconditionally caused a real erase/restore
+	//     flicker every time an avatar-url-less message got (re)processed.
+	//     UserInfo.Avatar left nil means "don't touch the avatar" (see
+	//     bridgev2 Ghost.UpdateInfo), not "remove it".
+	//  2. gc.shouldRefreshGhost throttles this to once per sender per
+	//     cooldown window, full stop -- fixing (1) alone wasn't enough,
+	//     because polling replays the same recent-messages page every 60s
+	//     forever, and that page can span a real nickname/avatar change;
+	//     without a cooldown, every poll tick re-walks the same span of
+	//     old/new snapshots and flips the ghost back and forth between
+	//     them, once per message per tick, indefinitely. Confirmed live:
+	//     exactly this pattern, recurring every ~60s (matching the poll
+	//     interval) for an active sender, for as long as the bridge ran.
+	//     See NOTES.md "Live incident: avatar flicker/reupload storm,
+	//     take two" for the full incident (the first fix only addressed
+	//     bug 1 above and was insufficient on its own).
+	if msg.Name != "" && msg.UserID != groupme.ID(gc.Meta.GMID) && gc.shouldRefreshGhost(msg.UserID) {
 		go func(gmid groupme.ID, name, avatarURL string) {
 			ctx := context.Background()
 			ghost, err := gc.Main.br.GetGhostByID(ctx, MakeUserID(gmid))

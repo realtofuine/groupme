@@ -58,6 +58,27 @@ type GMClient struct {
 	// doubt if that ever changes.
 	pollBackoffMu sync.Mutex
 	pollBackoff   map[string]time.Time
+
+	// ghostRefreshedAt tracks, per sender GroupMe ID, the last time
+	// HandleTextMessage's opportunistic ghost name/avatar refresh actually
+	// ran for them (see handlegroupme.go). Guarded by ghostRefreshMu.
+	//
+	// Needed because HandleTextMessage is called for every message polling
+	// re-fetches every tick (poll.go), not just genuinely new ones -- see
+	// its "safe to call unconditionally" reasoning, which is true for
+	// message bridging (bridgev2 core dedupes by message ID) but was NOT
+	// true for this refresh, which ran as a direct side effect before
+	// bridgev2 ever got a chance to dedupe anything. Confirmed live: a
+	// chat's most-recent ~20 messages can span a real nickname/avatar
+	// change, so replaying that same page every poll tick made the
+	// refresh flip back and forth between the old and new name/avatar
+	// forever, once per message per tick, generating a real, ever-growing
+	// stream of Matrix profile-change events (and, for avatars
+	// specifically, real re-uploads to the media repo) for any active
+	// sender -- see NOTES.md "Live incident: avatar flicker/reupload
+	// storm" for the first (avatar-only, still incomplete) fix attempt.
+	ghostRefreshMu   sync.Mutex
+	ghostRefreshedAt map[string]time.Time
 }
 
 var _ bridgev2.NetworkAPI = (*GMClient)(nil)
