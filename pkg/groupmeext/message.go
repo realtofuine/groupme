@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/beeper/groupme-lib"
@@ -35,95 +35,125 @@ func (m *Message) Value() (driver.Value, error) {
 	return e, nil
 }
 
-// DownloadImage helper function to download image from groupme;
-// append .large/.preview/.avatar to get various sizes
-func DownloadImage(URL string) (bytes *[]byte, mime string, err error) {
-	//TODO check its actually groupme?
-	response, err := http.Get(URL)
+// DownloadImage downloads an image attachment from GroupMe's image CDN
+// (i.groupme.com), a plain unauthenticated GET.
+func DownloadImage(url string) (data *[]byte, mime string, err error) {
+	resp, err := http.Get(url)
 	if err != nil {
-		return nil, "", errors.New("Failed to download avatar: " + err.Error())
-	}
-	defer response.Body.Close()
-
-	image, err := ioutil.ReadAll(response.Body)
-	bytes = &image
-	if err != nil {
-		return nil, "", errors.New("Failed to read downloaded image:" + err.Error())
-	}
-
-	mime = response.Header.Get("Content-Type")
-	if len(mime) == 0 {
-		mime = http.DetectContentType(image)
-	}
-	return
-}
-
-func DownloadFile(RoomJID groupme.ID, FileID string, token string) (contents []byte, fname, mime string) {
-	client := &http.Client{}
-	b, _ := json.Marshal(struct {
-		FileIDS []string `json:"file_ids"`
-	}{
-		FileIDS: []string{FileID},
-	})
-
-	req, _ := http.NewRequest("POST", fmt.Sprintf("https://file.groupme.com/v1/%s/fileData", RoomJID), bytes.NewReader(b))
-	req.Header.Add("X-Access-Token", token)
-	req.Header.Add("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		// TODO: FIX
-		panic(err)
-	}
-
-	defer resp.Body.Close()
-	data := []ImgData{}
-	json.NewDecoder(resp.Body).Decode(&data)
-	fmt.Println(data, RoomJID, FileID, token)
-	if len(data) < 1 {
-		return
-	}
-
-	req, _ = http.NewRequest("POST", fmt.Sprintf("https://file.groupme.com/v1/%s/files/%s", RoomJID, FileID), nil)
-	req.URL.Query().Add("token", token)
-	req.Header.Add("X-Access-Token", token)
-	resp, err = client.Do(req)
-	if err != nil {
-		// TODO: FIX
-		panic(err)
+		return nil, "", fmt.Errorf("failed to download image: %w", err)
 	}
 	defer resp.Body.Close()
 
-	bytes, _ := ioutil.ReadAll(resp.Body)
-	return bytes, data[0].FileData.FileName, data[0].FileData.Mime
-
-}
-
-func DownloadVideo(previewURL, videoURL, token string) (vidContents []byte, mime string) {
-	//preview TODO
-	client := &http.Client{}
-
-	req, _ := http.NewRequest("GET", videoURL, nil)
-	req.AddCookie(&http.Cookie{Name: "token", Value: token})
-	resp, err := client.Do(req)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println(err)
-		return nil, ""
+		return nil, "", fmt.Errorf("failed to read downloaded image: %w", err)
 	}
-	defer resp.Body.Close()
 
-	bytes, _ := ioutil.ReadAll(resp.Body)
 	mime = resp.Header.Get("Content-Type")
-	if len(mime) == 0 {
-		mime = http.DetectContentType(bytes)
+	if mime == "" {
+		mime = http.DetectContentType(body)
 	}
-	return bytes, mime
-
+	return &body, mime, nil
 }
 
-type ImgData struct {
+// DownloadVideo downloads a video attachment. Unlike images (a plain
+// public GET) and files (a signed X-Access-Token API call, see
+// DownloadFile), GroupMe's video CDN authenticates via a "token" cookie
+// carrying the account's access token -- ported as-is from the pre-2023
+// bridge (the only place this was ever verified to work against the real
+// API); not separately re-verified live in this revival, see NOTES.md.
+func DownloadVideo(videoURL, token string) (data []byte, mime string, err error) {
+	req, err := http.NewRequest(http.MethodGet, videoURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to build video request: %w", err)
+	}
+	req.AddCookie(&http.Cookie{Name: "token", Value: token})
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to download video: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read downloaded video: %w", err)
+	}
+
+	mime = resp.Header.Get("Content-Type")
+	if mime == "" {
+		mime = http.DetectContentType(data)
+	}
+	return data, mime, nil
+}
+
+// fileMetadata is the response shape of file.groupme.com's "fileData"
+// lookup endpoint (see DownloadFile).
+type fileMetadata struct {
 	FileData struct {
 		FileName string `json:"file_name"`
 		FileSize int    `json:"file_size"`
 		Mime     string `json:"mime_type"`
 	} `json:"file_data"`
+}
+
+// DownloadFile downloads a "file" attachment (GroupMe's group file-sharing
+// feature, distinct from image/video message attachments) via
+// file.groupme.com. This is a two-step API, both authenticated via
+// X-Access-Token: one call resolves the file's name/mime type, a second
+// fetches its bytes. groupID is the containing group's ID -- GroupMe's
+// file-sharing feature is group-only, so this isn't expected to be called
+// for a DM attachment.
+//
+// Ported from the pre-2023 bridge's equivalent, which used to panic() on
+// any request error here -- a network hiccup on a single file attachment
+// would have taken down the entire bridge process. Rewritten to return an
+// error instead, same as every other attachment download path.
+func DownloadFile(groupID groupme.ID, fileID, token string) (data []byte, filename, mime string, err error) {
+	reqBody, err := json.Marshal(struct {
+		FileIDs []string `json:"file_ids"`
+	}{FileIDs: []string{fileID}})
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to build file metadata request body: %w", err)
+	}
+
+	metaReq, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://file.groupme.com/v1/%s/fileData", groupID), bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to build file metadata request: %w", err)
+	}
+	metaReq.Header.Set("X-Access-Token", token)
+	metaReq.Header.Set("Content-Type", "application/json")
+
+	metaResp, err := http.DefaultClient.Do(metaReq)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to fetch file metadata: %w", err)
+	}
+	defer metaResp.Body.Close()
+
+	var meta []fileMetadata
+	if err := json.NewDecoder(metaResp.Body).Decode(&meta); err != nil {
+		return nil, "", "", fmt.Errorf("failed to decode file metadata: %w", err)
+	}
+	if len(meta) == 0 {
+		return nil, "", "", fmt.Errorf("GroupMe returned no metadata for file %s", fileID)
+	}
+
+	dlReq, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://file.groupme.com/v1/%s/files/%s", groupID, fileID), nil)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to build file download request: %w", err)
+	}
+	dlReq.Header.Set("X-Access-Token", token)
+
+	dlResp, err := http.DefaultClient.Do(dlReq)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to download file: %w", err)
+	}
+	defer dlResp.Body.Close()
+
+	data, err = io.ReadAll(dlResp.Body)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to read downloaded file: %w", err)
+	}
+
+	return data, meta[0].FileData.FileName, meta[0].FileData.Mime, nil
 }

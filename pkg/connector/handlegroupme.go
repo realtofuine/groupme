@@ -19,8 +19,11 @@ package connector
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -84,45 +87,142 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 		ID:   MakeMessageID(msg.ID),
 		Data: &msg,
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *groupme.Message) (*bridgev2.ConvertedMessage, error) {
-			return convertGroupMeMessage(ctx, portal, intent, data)
+			return convertGroupMeMessage(ctx, portal, intent, data, gc.Meta.Token)
 		},
 	})
 }
 
 // convertGroupMeMessage builds the Matrix message parts for an incoming
-// GroupMe message, including any attachments. Currently supported
-// attachment types: image. Other types (video, file, location) from the
-// legacy bridge have not been ported yet, see NOTES.md.
-func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *groupme.Message) (*bridgev2.ConvertedMessage, error) {
+// GroupMe message, including any attachments. token is the account's own
+// GroupMe access token, needed by the video/file download paths (see
+// groupmeext.DownloadVideo/DownloadFile) -- image attachments don't need
+// it, GroupMe's image CDN is a plain public GET.
+func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *groupme.Message, token string) (*bridgev2.ConvertedMessage, error) {
 	cm := &bridgev2.ConvertedMessage{}
+	log := zerolog.Ctx(ctx)
 
 	for i, att := range msg.Attachments {
-		if att.Type != "image" {
+		partID := networkid.PartID(fmt.Sprintf("attachment-%d", i))
+		var content *event.MessageEventContent
+
+		switch att.Type {
+		case groupme.Image:
+			imgData, mime, err := groupmeext.DownloadImage(att.URL)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to download GroupMe image attachment")
+				continue
+			}
+			mxc, file, err := intent.UploadMedia(ctx, portal.MXID, *imgData, "image", mime)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to upload GroupMe image attachment to Matrix media repo")
+				continue
+			}
+			content = &event.MessageEventContent{
+				MsgType: event.MsgImage,
+				Body:    "image",
+				Info: &event.FileInfo{
+					MimeType: mime,
+					Size:     len(*imgData),
+				},
+			}
+			if file != nil {
+				content.File = file
+			} else {
+				content.URL = mxc
+			}
+
+		case groupme.Video:
+			vidData, mime, err := groupmeext.DownloadVideo(att.URL, token)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to download GroupMe video attachment")
+				continue
+			}
+			mxc, file, err := intent.UploadMedia(ctx, portal.MXID, vidData, "video", mime)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to upload GroupMe video attachment to Matrix media repo")
+				continue
+			}
+			content = &event.MessageEventContent{
+				MsgType: event.MsgVideo,
+				Body:    "video",
+				Info: &event.FileInfo{
+					MimeType: mime,
+					Size:     len(vidData),
+				},
+			}
+			if file != nil {
+				content.File = file
+			} else {
+				content.URL = mxc
+			}
+
+		case groupme.File:
+			// GroupMe's file-sharing feature is group-only (no known DM
+			// equivalent), and its download API is keyed by group ID, not
+			// conversation ID -- msg.GroupID is empty for DMs, so this
+			// deliberately no-ops rather than guessing a wrong ID for
+			// something that shouldn't be reachable from a DM anyway.
+			if len(msg.GroupID) == 0 {
+				log.Warn().Str("file_id", att.FileID).Msg("Got a GroupMe file attachment outside a group chat, don't know how to fetch it")
+				continue
+			}
+			fileData, filename, mime, err := groupmeext.DownloadFile(msg.GroupID, att.FileID, token)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to download GroupMe file attachment")
+				continue
+			}
+			if mime == "" {
+				mime = http.DetectContentType(fileData)
+			}
+			mxc, file, err := intent.UploadMedia(ctx, portal.MXID, fileData, filename, mime)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to upload GroupMe file attachment to Matrix media repo")
+				continue
+			}
+			content = &event.MessageEventContent{
+				MsgType: event.MsgFile,
+				Body:    filename,
+				Info: &event.FileInfo{
+					MimeType: mime,
+					Size:     len(fileData),
+				},
+			}
+			if file != nil {
+				content.File = file
+			} else {
+				content.URL = mxc
+			}
+
+		case groupme.Location:
+			lat, latErr := strconv.ParseFloat(att.Latitude, 64)
+			lng, lngErr := strconv.ParseFloat(att.Longitude, 64)
+			if latErr != nil || lngErr != nil {
+				log.Warn().Str("lat", att.Latitude).Str("lng", att.Longitude).
+					Msg("Failed to parse GroupMe location attachment coordinates")
+				continue
+			}
+			name := att.Name
+			if name == "" {
+				name = "Location"
+			}
+			content = &event.MessageEventContent{
+				MsgType: event.MsgLocation,
+				Body:    fmt.Sprintf("%s: %.5f,%.5f", name, lat, lng),
+				GeoURI:  fmt.Sprintf("geo:%.5f,%.5f", lat, lng),
+			}
+
+		default:
+			// Mentions/Emoji/Reply attachments ride alongside msg.Text
+			// rather than needing their own message part (mentions are
+			// just formatting metadata over the text; a reply's quoted
+			// content isn't bridged as a separate part here -- see
+			// NOTES.md "Known gaps"), and anything genuinely unknown is
+			// safe to just skip rather than fail the whole message over.
 			continue
 		}
-		imgData, mime, err := groupmeext.DownloadImage(att.URL)
-		if err != nil {
-			continue
-		}
-		mxc, file, err := intent.UploadMedia(ctx, portal.MXID, *imgData, "image", mime)
-		if err != nil {
-			continue
-		}
-		content := &event.MessageEventContent{
-			MsgType: event.MsgImage,
-			Body:    "image",
-			Info: &event.FileInfo{
-				MimeType: mime,
-				Size:     len(*imgData),
-			},
-		}
-		if file != nil {
-			content.File = file
-		} else {
-			content.URL = mxc
-		}
+
 		cm.Parts = append(cm.Parts, &bridgev2.ConvertedMessagePart{
-			ID:      networkid.PartID(fmt.Sprintf("attachment-%d", i)),
+			ID:      partID,
 			Type:    event.EventMessage,
 			Content: content,
 		})
