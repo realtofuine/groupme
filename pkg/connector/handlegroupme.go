@@ -18,9 +18,11 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -87,19 +89,41 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 		ID:   MakeMessageID(msg.ID),
 		Data: &msg,
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *groupme.Message) (*bridgev2.ConvertedMessage, error) {
-			return convertGroupMeMessage(ctx, portal, intent, data, gc.Meta.Token)
+			return convertGroupMeMessage(ctx, portal, intent, data, gc.Client, gc.Meta.Token)
 		},
 	})
 }
 
 // convertGroupMeMessage builds the Matrix message parts for an incoming
-// GroupMe message, including any attachments. token is the account's own
-// GroupMe access token, needed by the video/file download paths (see
-// groupmeext.DownloadVideo/DownloadFile) -- image attachments don't need
-// it, GroupMe's image CDN is a plain public GET.
-func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *groupme.Message, token string) (*bridgev2.ConvertedMessage, error) {
+// GroupMe message, including any attachments or poll event. token is the
+// account's own GroupMe access token, needed by the video/file download
+// paths (see groupmeext.DownloadVideo/DownloadFile) -- image attachments
+// don't need it, GroupMe's image CDN is a plain public GET. client is
+// needed separately to fetch a poll's full definition (see
+// convertGroupMePollEvent/groupme.Client.GetPoll) -- unlike the raw HTTP
+// download helpers, that's a normal authenticated groupme-lib API call.
+func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *groupme.Message, client *groupmeext.Client, token string) (*bridgev2.ConvertedMessage, error) {
 	cm := &bridgev2.ConvertedMessage{}
 	log := zerolog.Ctx(ctx)
+
+	// Poll lifecycle messages (poll.created/poll.reminder/poll.finished)
+	// carry their real content in Event.Data, not as a normal attachment
+	// -- the "poll" attachment some of them also carry (see the Poll
+	// attachmentType's doc comment) is just a pointer, not enough on its
+	// own to render anything useful. Handle these separately and return
+	// early; falling through to the attachment loop below would either
+	// skip the poll attachment as unhandled (poll.created) or find no
+	// attachments at all (poll.reminder/poll.finished have none), in both
+	// cases falling back to GroupMe's own bare-text notice
+	// ("Created new poll 'X'") instead of the actual question/options/
+	// results.
+	if msg.Event != nil && strings.HasPrefix(msg.Event.Type, "poll.") {
+		if part := convertGroupMePollEvent(ctx, client, msg); part != nil {
+			cm.Parts = append(cm.Parts, part)
+			return cm, nil
+		}
+		log.Warn().Str("event_type", msg.Event.Type).Msg("Failed to convert GroupMe poll event, falling back to bare message text")
+	}
 
 	for i, att := range msg.Attachments {
 		partID := networkid.PartID(fmt.Sprintf("attachment-%d", i))
@@ -211,6 +235,13 @@ func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent 
 				GeoURI:  fmt.Sprintf("geo:%.5f,%.5f", lat, lng),
 			}
 
+		case groupme.Poll:
+			// Handled above via msg.Event, before this loop even starts --
+			// reaching this case means that handling didn't produce a
+			// part (e.g. Event was nil/malformed for some reason), so
+			// there's nothing useful to do with just the poll ID here.
+			continue
+
 		default:
 			// Mentions/Emoji/Reply attachments ride alongside msg.Text
 			// rather than needing their own message part (mentions are
@@ -240,6 +271,94 @@ func convertGroupMeMessage(ctx context.Context, portal *bridgev2.Portal, intent 
 	}
 
 	return cm, nil
+}
+
+// convertGroupMePollEvent renders a poll.created/poll.reminder/
+// poll.finished event (see json.go's Event/PollEventData) as a single
+// readable text message part. Returns nil if the event's Data couldn't be
+// parsed or its Type isn't one of the three handled here, so the caller
+// can fall back to GroupMe's own plain-text notice instead of dropping
+// the message.
+//
+// Matrix has a native poll event type (MSC3381) that Element and some
+// other clients render as an interactive, votable widget; this
+// deliberately doesn't use it. Two-way vote sync (a Matrix poll vote ->
+// GroupMe's vote API, and GroupMe vote changes -> updating the Matrix
+// poll's state) would be a substantially bigger feature -- tracking poll
+// state across both sides, handling a poll closing on either end, etc --
+// and hasn't been attempted here; this only makes the poll's
+// question/options/results legible as a normal message, matching the
+// scope of every other attachment type this bridge bridges one-way.
+func convertGroupMePollEvent(ctx context.Context, client *groupmeext.Client, msg *groupme.Message) *bridgev2.ConvertedMessagePart {
+	log := zerolog.Ctx(ctx)
+
+	var data groupme.PollEventData
+	if err := json.Unmarshal(msg.Event.Data, &data); err != nil {
+		log.Warn().Err(err).Str("event_type", msg.Event.Type).Msg("Failed to parse GroupMe poll event data")
+		return nil
+	}
+
+	var body string
+	switch msg.Event.Type {
+	case "poll.created":
+		poll, err := client.GetPoll(ctx, data.Conversation.ID, data.Poll.ID)
+		if err != nil {
+			// Best-effort: GroupMe's own notice text already mentions the
+			// poll by name, so a failed detail fetch degrades to
+			// "here's a poll, go look at it in the app" instead of losing
+			// the message entirely.
+			log.Warn().Err(err).Str("poll_id", data.Poll.ID).Msg("Failed to fetch GroupMe poll details, falling back to bare subject")
+			body = fmt.Sprintf("📊 New poll: \"%s\"\nVote in the GroupMe app.", data.Poll.Subject)
+			break
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "📊 New poll: \"%s\"\n", poll.Subject)
+		for _, opt := range poll.Options {
+			fmt.Fprintf(&b, "• %s\n", opt.Title)
+		}
+		visibility := poll.Visibility
+		if visibility == "" {
+			visibility = "anonymous"
+		}
+		fmt.Fprintf(&b, "\nVote in the GroupMe app (%s voting)", visibility)
+		if poll.Expiration > 0 {
+			fmt.Fprintf(&b, ". Closes %s.", poll.Expiration.ToTime().Local().Format("Jan 2, 3:04 PM"))
+		} else {
+			b.WriteString(".")
+		}
+		body = b.String()
+
+	case "poll.finished":
+		var b strings.Builder
+		fmt.Fprintf(&b, "📊 Poll ended: \"%s\"\n", data.Poll.Subject)
+		for _, opt := range data.Options {
+			plural := "s"
+			if opt.Votes == 1 {
+				plural = ""
+			}
+			fmt.Fprintf(&b, "• %s — %d vote%s\n", opt.Title, opt.Votes, plural)
+		}
+		body = strings.TrimRight(b.String(), "\n")
+
+	case "poll.reminder":
+		body = fmt.Sprintf("📊 Poll \"%s\" is about to close.", data.Poll.Subject)
+
+	default:
+		// Some other poll.* event type not seen live (GroupMe's poll
+		// lifecycle has only ever been observed to emit these three) --
+		// rather than guess at a format, let the caller fall back to
+		// GroupMe's own message text.
+		return nil
+	}
+
+	return &bridgev2.ConvertedMessagePart{
+		ID:   "",
+		Type: event.EventMessage,
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgText,
+			Body:    body,
+		},
+	}
 }
 
 // HandleLike is called when GroupMe reports that a message's reactions
