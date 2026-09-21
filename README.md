@@ -54,14 +54,34 @@ behind each fix.
   list, which — confirmed live — doesn't include everyone you have an
   active chat with). Names and avatars also opportunistically refresh
   from message sender data, which additionally covers people who've since
-  left a group. This caused two real live bugs, both now fixed and
-  verified under real sustained traffic: (1) a message without an
-  avatar URL was erasing the ghost's real avatar instead of leaving it
-  alone, and (2) REST polling replaying old messages every 60s tick could
-  flip a sender's name/avatar back and forth indefinitely if their recent
-  message history spanned a real change — fixed with a per-sender
-  10-minute cooldown on the refresh. See NOTES.md "Live incident: avatar
-  flicker/reupload storm" (both entries — the fix took two attempts).
+  left a group. This caused three real live bugs before landing on a
+  correct fix, all now resolved and verified under real sustained
+  traffic: (1) a message without an avatar URL was erasing the ghost's
+  real avatar instead of leaving it alone; (2) REST polling replaying old
+  messages every 60s tick could flip a sender's name/avatar back and
+  forth indefinitely if their recent message history spanned a real
+  change — a per-sender cooldown reduced this but didn't fully fix it;
+  (3) even with the cooldown, a message with genuinely corrupted
+  GroupMe-side data (two real senders had a years-old message on record
+  literally naming its sender "GroupMe") could still periodically
+  overwrite a ghost's real name. The actual fix: the refresh now skips
+  entirely unless the message has never been bridged before, eliminating
+  "replaying old messages can mutate a ghost's profile" as a category of
+  bug rather than patching around specific bad values. See NOTES.md
+  "Live incident: avatar/name flicker" (three entries — "take one",
+  "take two", "take three").
+- **Historical spam cleanup**: the bugs above left thousands of
+  "changed their name"/"changed their profile picture" events cluttering
+  affected rooms' timelines (110,469 across 13 people and every room
+  each appeared in, as of 2026-09-21 — slow enough to load that the user
+  asked for cleanup). Redacted via each ghost redacting its own
+  historical `m.room.member` events (Matrix always allows redacting your
+  own events, regardless of room power level — no server-admin access
+  was available or needed), preserving each ghost's current state event
+  and leaving real chat messages untouched. See NOTES.md "Cleaning up
+  the historical spam left behind" for the full approach; the cleanup
+  script itself isn't part of this repo (a one-off Matrix API tool, not
+  bridge code).
 - **Health-check/alerting** (outside this repo, lives on the host at
   `/matrix/health-check/`): a systemd timer every 5 minutes checks that
   all Matrix-related services are up and greps recent logs for

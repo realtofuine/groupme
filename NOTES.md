@@ -1180,3 +1180,122 @@ still broken. A real fix verification for anything poll-interval-shaped
 needs to span multiple poll cycles under real ongoing traffic, not a
 single quiet window -- exactly what both fixes in this document now
 did, but only the second one was checked that way from the start.
+
+## Live incident: avatar/name flicker, take three -- the actual root cause (2026-09-21)
+
+The user asked to clean up the historical spam left behind by the two
+incidents above (thousands of accumulated "changed their name"/"changed
+their profile picture" events cluttering room timelines, slowing message
+loading in Element). Handled via Matrix redaction -- see "Cleaning up
+the historical spam" below -- but while spot-checking the cleanup's
+results, one ghost's *current* (not historical) name was found wrong:
+`@groupme_81821868:rishi-rai.com` (real name "CJ Ness") was showing as
+literally **"GroupMe"** in two rooms. A live journalctl trace pinned
+this to a real `PUT .../profile/.../displayname` with body
+`{"displayname":"GroupMe"}`, sent moments before by the *still-running,
+already-take-two-fixed* bridge -- not a redaction artifact.
+
+Root cause, finally the actual one: `GetChatInfo`/GroupMe's live group
+data was never wrong. The *opportunistic per-message ghost refresh*
+(the same feature responsible for takes one and two above) was still
+capable of overwriting a ghost's real name with garbage, because the
+take-two fix (a 10-minute per-sender cooldown) only throttled
+*frequency* -- it never addressed *correctness*. Confirmed live: two
+real senders (`81821868` "CJ Ness", `70576355` "Rapha MC") each have a
+years-old message on record (from 2021/2022) where GroupMe's own API
+returns the literal string `"GroupMe"` as that message's recorded
+sender name -- apparently a real GroupMe-side data artifact from
+whenever those specific messages first went through (a plausible guess:
+sent before the account had a nickname set, or via some
+integration/webhook path that defaulted to the app's own name). REST
+polling replaying that *one* old message was enough to overwrite the
+ghost's real name every time the cooldown lapsed -- roughly every 10
+minutes, indefinitely, for as long as the bridge ran. 10 confirmed
+occurrences across about 3 hours of logs before this fix, isolated to
+exactly these 2 of the 13 originally-affected people (everyone else's
+message history apparently doesn't contain this specific artifact).
+
+**The actual fix** (`pkg/connector/handlegroupme.go`): stop trying to
+distinguish "good" stale data from "bad" stale data (impossible to do
+reliably -- take two tried exactly that, by rate-limiting rather than
+eliminating, and a bad value still got through). Instead, skip the
+refresh entirely unless the message has never been bridged before,
+checked via `gc.Main.br.DB.Message.GetAllPartsByID` -- the exact same
+existence check bridgev2 core itself uses for its own message dedup
+(see "REST polling fallback" above). A message already in the database
+is not fresh information about its sender, full stop, regardless of
+what its content says -- this eliminates the entire class of bug (any
+message, with any content, old or new, corrupted or not, replayed by
+polling) rather than the two specific instances discovered so far. The
+per-sender cooldown from take two is kept as a secondary guard against
+redundant work during a legitimate burst of new messages, but it's no
+longer the thing actually preventing corruption.
+
+Verified live: deployed; the deploy's own restart re-ran the bridge's
+full initial sync (`sync.go`), which derives every ghost's name from
+GroupMe's live current group-member data, not message snapshots --
+both previously-corrupted ghosts (CJ Ness, Rapha MC) were already
+showing their correct real names again immediately, no manual
+intervention needed. Watched logs for 2+ minutes afterward with the
+precise query that would have caught a recurrence -- zero hits.
+Followed up with a scripted check of every (room, ghost) pair touched
+by the redaction cleanup below: 6 of 24 initially looked like
+mismatches against an expected-name list, but every one turned out to
+be a legitimate per-group nickname difference (GroupMe nicknames are
+set per-group, not account-wide -- confirmed directly against
+GroupMe's live API, e.g. `81821890` really is "James" in one group and
+"James Sutherland" elsewhere) -- not a bug, just an artifact of the
+verification script's own oversimplified comparison list. Zero actual
+corruption remained anywhere checked.
+
+## Cleaning up the historical spam left behind (2026-09-21)
+
+Once take two's fix was believed complete (it wasn't fully -- see take
+three above, found *during* this cleanup), the user asked to clean up
+the thousands of accumulated spam events the first two incidents had
+already created, since they were slowing down message loading in
+Element. Scoped this carefully given it's a real, mostly-irreversible
+live-room-state operation:
+
+- **No server-admin access available** (checked: the real account isn't
+  a Synapse admin), and the standard "redact as the room owner" path
+  didn't work either -- checked the affected rooms' power levels and
+  found `redact: 50` required with `users: {}` (nobody, including the
+  real account, has an elevated power level in these appservice-created
+  rooms). Neither the Synapse admin API nor regular room-owner
+  permissions were usable here.
+- **The actual approach**: Matrix always allows a user to redact their
+  *own* events regardless of power level. Since every spam event was
+  sent by the ghost itself (the ghost's own opportunistic-refresh-driven
+  `SetDisplayName`/`SetAvatarURL` calls), and the
+  bridge's appservice token can act as any ghost in its own namespace
+  (`?user_id=@groupme_<id>:rishi-rai.com`, the same mechanism used for
+  double-puppeting the real account, just without needing that account
+  to be specifically allowlisted), each ghost could redact its own
+  historical `m.room.member` events directly -- no privilege escalation,
+  no admin grant, nothing touched outside each ghost's own event
+  history.
+- **Filtered strictly by type and sender** (`/messages` with
+  `{"types": ["m.room.member"], "senders": [ghost]}`), and always
+  preserved the *current* (latest) state event per ghost per room,
+  redacting only the superseded ones -- confirmed live this doesn't
+  affect current room state (redacting a non-current state event has no
+  effect on what "current state" resolves to) and doesn't touch actual
+  chat messages at all (spot-checked real `m.room.message` events from
+  the same senders before and after -- untouched).
+- **Scale**: first tested on one room with a small batch (5 events),
+  verified state integrity and that a real message stayed intact, then
+  scaled up. Total across the account: found 13 people with
+  significant accumulated spam (well beyond the 2 the user had
+  personally noticed), 40 (room, person) combinations across every
+  group/DM each of them appears in, **110,469 events redacted total**,
+  spread over roughly 2 hours of runtime (4-way parallel batches --
+  each room/ghost combination is its own independent script run,
+  hundreds to low thousands of individual redaction API calls each).
+  Zero failures across all 40 runs.
+- Scripts used for this lived at
+  `/tmp/.../scratchpad/clean_member_spam.py` and were not committed to
+  this repo -- they're a one-off Matrix Client-Server API cleanup tool,
+  not part of the bridge itself, and there's no reason to expect this
+  exact cleanup will need repeating now that take three's fix addresses
+  the actual root cause.
