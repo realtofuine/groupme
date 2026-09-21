@@ -88,12 +88,12 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 	// covers former members. Best-effort and non-blocking: message
 	// delivery must not wait on this.
 	//
-	// Two real production bugs found in this one feature, both from the
-	// same underlying mistake -- treating "a message mentions this sender"
-	// as if it meant "this is fresh, current info about this sender",
-	// when a message is really a snapshot from whenever it was *sent*,
-	// and this function runs for every message polling re-fetches every
-	// tick (poll.go), not just genuinely new ones:
+	// Three real production bugs found in this one feature so far, all
+	// from the same underlying mistake -- treating "a message mentions
+	// this sender" as if it meant "this is fresh, current info about this
+	// sender", when a message is really a snapshot from whenever it was
+	// *sent*, and this function runs for every message polling re-fetches
+	// every tick (poll.go), not just genuinely new ones:
 	//
 	//  1. msg.AvatarURL is only ever passed through when non-empty --
 	//     confirmed live that GroupMe does NOT reliably echo it on every
@@ -103,20 +103,47 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 	//     UserInfo.Avatar left nil means "don't touch the avatar" (see
 	//     bridgev2 Ghost.UpdateInfo), not "remove it".
 	//  2. gc.shouldRefreshGhost throttles this to once per sender per
-	//     cooldown window, full stop -- fixing (1) alone wasn't enough,
-	//     because polling replays the same recent-messages page every 60s
-	//     forever, and that page can span a real nickname/avatar change;
-	//     without a cooldown, every poll tick re-walks the same span of
-	//     old/new snapshots and flips the ghost back and forth between
-	//     them, once per message per tick, indefinitely. Confirmed live:
-	//     exactly this pattern, recurring every ~60s (matching the poll
-	//     interval) for an active sender, for as long as the bridge ran.
+	//     cooldown window -- fixing (1) alone wasn't enough, because
+	//     polling replays the same recent-messages page every 60s forever,
+	//     and that page can span a real nickname/avatar change; without a
+	//     cooldown, every poll tick re-walks the same span of old/new
+	//     snapshots and flips the ghost back and forth between them, once
+	//     per message per tick, indefinitely.
+	//  3. Even with the cooldown, a genuinely bad snapshot could still get
+	//     through and *persist* for the whole cooldown window: confirmed
+	//     live, two real senders had a years-old message on record with
+	//     GroupMe's own literal "GroupMe" as the recorded sender name
+	//     (apparently a real GroupMe-side data artifact from whenever
+	//     those messages were originally sent), and polling replaying that
+	//     one old message was enough to overwrite their ghost's real name
+	//     with "GroupMe" every time the cooldown lapsed. The cooldown
+	//     controls *frequency*; it does nothing about *correctness* when
+	//     the stale snapshot itself is bad. Fixed at the root instead of
+	//     patching around it further: skip the refresh entirely unless
+	//     this specific message hasn't been bridged before (i.e. this is
+	//     the message's first time through this function, live push or
+	//     first poll sighting -- never a replay). A message already in the
+	//     DB is, by definition, not fresh information about its sender no
+	//     matter what it says.
 	//     See NOTES.md "Live incident: avatar flicker/reupload storm,
-	//     take two" for the full incident (the first fix only addressed
-	//     bug 1 above and was insufficient on its own).
-	if msg.Name != "" && msg.UserID != groupme.ID(gc.Meta.GMID) && gc.shouldRefreshGhost(msg.UserID) {
-		go func(gmid groupme.ID, name, avatarURL string) {
+	//     take three" for the full incident -- discovered mid-cleanup of
+	//     the historical spam these earlier attempts left behind.
+	if msg.Name != "" && msg.UserID != groupme.ID(gc.Meta.GMID) {
+		go func(gmid groupme.ID, name, avatarURL string, id networkid.MessageID) {
 			ctx := context.Background()
+			if existing, err := gc.Main.br.DB.Message.GetAllPartsByID(ctx, gc.UserLogin.ID, id); err != nil {
+				gc.UserLogin.Log.Warn().Err(err).Str("gmid", string(gmid)).
+					Msg("Failed to check if message is new before opportunistic ghost refresh, skipping to be safe")
+				return
+			} else if len(existing) > 0 {
+				// Already bridged -- this is polling replaying old
+				// history, not a genuinely new message. Its sender
+				// snapshot is stale by definition; see bug 3 above.
+				return
+			}
+			if !gc.shouldRefreshGhost(gmid) {
+				return
+			}
 			ghost, err := gc.Main.br.GetGhostByID(ctx, MakeUserID(gmid))
 			if err != nil {
 				gc.UserLogin.Log.Warn().Err(err).Str("gmid", string(gmid)).
@@ -128,7 +155,7 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 				info.Avatar = avatarFor(avatarURL)
 			}
 			ghost.UpdateInfo(ctx, info)
-		}(msg.UserID, msg.Name, msg.AvatarURL)
+		}(msg.UserID, msg.Name, msg.AvatarURL, MakeMessageID(msg.ID))
 	}
 
 	gc.Main.br.QueueRemoteEvent(gc.UserLogin, &simplevent.Message[*groupme.Message]{
