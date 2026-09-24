@@ -321,7 +321,7 @@ func (gc *GMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matr
 	portalType, gmid := ParsePortalID(msg.Portal.ID)
 	conversationID := gmid
 	if portalType == PortalTypeDM {
-		conversationID = groupme.ID(gc.Meta.GMID)
+		conversationID = DMConversationID(groupme.ID(gc.Meta.GMID), gmid)
 	}
 	messageID := ParseMessageID(msg.TargetMessage.ID)
 	var emoji string
@@ -341,7 +341,7 @@ func (gc *GMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev
 	portalType, gmid := ParsePortalID(msg.Portal.ID)
 	conversationID := gmid
 	if portalType == PortalTypeDM {
-		conversationID = groupme.ID(gc.Meta.GMID)
+		conversationID = DMConversationID(groupme.ID(gc.Meta.GMID), gmid)
 	}
 	messageID := ParseMessageID(msg.TargetReaction.MessageID)
 	err := gc.Client.DestroyLike(ctx, conversationID, messageID)

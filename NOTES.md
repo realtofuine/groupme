@@ -1299,3 +1299,52 @@ live-room-state operation:
   not part of the bridge itself, and there's no reason to expect this
   exact cleanup will need repeating now that take three's fix addresses
   the actual root cause.
+
+## Log review: four small fixes (2026-09-24)
+
+A pass over 24 hours of live logs turned up 32 warning/error lines. One
+cluster wasn't ours; four real bugs were fixed.
+
+**Not ours: GroupMe outage, 22:01-22:10 UTC.** About 20 poll failures with
+500/503/408 from api.groupme.com, including one whose body was GroupMe's own
+internal `read tcp 127.0.0.1:...:22121: i/o timeout`. Polling kept retrying
+and recovered by itself once GroupMe did. Nothing to change.
+
+**1. False "websocket down for 5 minutes" alert on every routine drop.**
+`lastConnected` was only set at handshake, so the first disconnect after
+hours of healthy uptime measured all that uptime as downtime. The Error line
+fired the same millisecond as the disconnect, with `down_for` of 4-8 hours,
+4 times a day. That's noise in exactly the alert the health check greps for.
+`connectAndRun` now also stamps `markConnected` on the way out (deferred)
+after a successful handshake, so the clock starts when the connection
+actually drops.
+
+**2. Reconnect backoff never reset.** `Listen`'s backoff doubled on every
+return and was never reset. After any early failure streak it sat at the 60s
+cap forever, so every later routine drop waited a full minute to reconnect
+(every disconnect in the logs showed `retry_in=60000`). `connectAndRun` now
+reports whether it handshook, and a connection that really came up resets
+the backoff to 1s.
+
+**3. Reactions in DMs always 404'd.** `HandleMatrixReaction` and
+`HandleMatrixReactionRemove` passed only the logged-in user's ID as the DM's
+conversation ID. GroupMe's DM conversation ID is both user IDs joined by `+`,
+numerically smaller first (e.g. `87270184+106452543`). Confirmed against the
+`conversation_id` of all 55 DMs from `/v3/chats`, including DMs where the
+other user's ID is lower and where it's higher. Added
+`DMConversationID` (pkg/connector/id.go). Group reactions were unaffected.
+Not re-verified with a live like, to avoid sending a duplicate reaction
+notification; the next real DM reaction will confirm it.
+
+**4. Access token leaked into logs.** `doWithAuthToken` puts the token in
+the query string, and net/http's `*url.Error` embeds the full URL. So any
+transport error (connection reset, timeout) logged the token verbatim; one
+did on 2026-09-24. `Client.do` now strips the query from `*url.Error`
+before returning it. Verified with a throwaway test against a refused port.
+The token still appears in journald lines logged before this fix.
+
+Also seen and left alone: WhatsApp's 4 routine 503 stream-end reconnects
+(self-healed), Synapse `task_scheduler` `KeyError` tracebacks (a race
+inside Synapse's own scheduler, triggered by the join burst when a bridge
+restarts; harmless), and a few `403 not invited` join denials (bridgev2
+tries the join, then invites and retries).

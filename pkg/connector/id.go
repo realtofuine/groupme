@@ -18,6 +18,7 @@ package connector
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -43,6 +44,22 @@ func ParsePortalID(id networkid.PortalID) (PortalType, groupme.ID) {
 		return "", ""
 	}
 	return PortalType(parts[0]), groupme.ID(parts[1])
+}
+
+// DMConversationID builds the conversation ID GroupMe uses for a DM between
+// two users in endpoints like /messages/:conversation_id/:message_id/like:
+// both user IDs joined by "+", numerically smaller first (e.g.
+// "87270184+106452543"). Confirmed against the conversation_id field of
+// every DM returned by /v3/chats on 2026-09-24 -- all 55 were ordered this
+// way regardless of which side is the logged-in user. Passing just one
+// user's ID (what this bridge previously did) 404s.
+func DMConversationID(a, b groupme.ID) groupme.ID {
+	an, aErr := strconv.ParseUint(string(a), 10, 64)
+	bn, bErr := strconv.ParseUint(string(b), 10, 64)
+	if aErr == nil && bErr == nil && an > bn {
+		a, b = b, a
+	}
+	return a + "+" + b
 }
 
 func MakeUserID(gmid groupme.ID) networkid.UserID {

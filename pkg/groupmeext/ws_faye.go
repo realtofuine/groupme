@@ -553,15 +553,16 @@ func (c *WSFayeClient) maybeLogSustainedDegradation() {
 // connectAndRun dials one websocket connection, handshakes, resubscribes,
 // and runs the read/connect loops until either fails or the connection
 // drops. It always returns a non-nil error (Listen treats every return as
-// "reconnect after a backoff").
-func (c *WSFayeClient) connectAndRun(ctx context.Context) error {
+// "reconnect after a backoff"); handshook reports whether the connection
+// got far enough to be genuinely up, so Listen can reset its backoff.
+func (c *WSFayeClient) connectAndRun(ctx context.Context) (handshook bool, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	conn, _, err := websocket.Dial(dialCtx, c.url, &websocket.DialOptions{
 		HTTPClient: wsDialHTTPClient,
 	})
 	cancel()
 	if err != nil {
-		return fmt.Errorf("dialing %s: %w", c.url, err)
+		return false, fmt.Errorf("dialing %s: %w", c.url, err)
 	}
 	conn.SetReadLimit(1 << 20) // 1MiB; Bayeux/GroupMe push frames are small JSON
 
@@ -584,10 +585,17 @@ func (c *WSFayeClient) connectAndRun(ctx context.Context) error {
 	go func() { readErrCh <- c.readLoop(runCtx, conn) }()
 
 	if err := c.handshake(runCtx, conn); err != nil {
-		return fmt.Errorf("handshake: %w", err)
+		return false, fmt.Errorf("handshake: %w", err)
 	}
 	c.log.Info().Str("client_id", c.clientID).Msg("GroupMe push websocket handshake succeeded")
 	c.markConnected()
+	// The connection was up right until this returns, so that's when the
+	// "how long has this been down" clock should start -- not at the
+	// handshake. Without this, the first disconnect after hours of healthy
+	// uptime measured the whole uptime as downtime and fired the sustained
+	// degradation alert immediately (seen live: down_for of 4-8 hours logged
+	// the same millisecond as the disconnect itself).
+	defer c.markConnected()
 
 	c.resubscribeAll(runCtx)
 
@@ -599,11 +607,11 @@ func (c *WSFayeClient) connectAndRun(ctx context.Context) error {
 
 	select {
 	case err := <-readErrCh:
-		return fmt.Errorf("read loop: %w", err)
+		return true, fmt.Errorf("read loop: %w", err)
 	case err := <-connectErrCh:
-		return fmt.Errorf("connect loop: %w", err)
+		return true, fmt.Errorf("connect loop: %w", err)
 	case err := <-pingErrCh:
-		return fmt.Errorf("ping loop: %w", err)
+		return true, fmt.Errorf("ping loop: %w", err)
 	}
 }
 
@@ -667,7 +675,13 @@ func (c *WSFayeClient) Listen() {
 	backoff := time.Second
 	const maxBackoff = 60 * time.Second
 	for {
-		err := c.connectAndRun(context.Background())
+		handshook, err := c.connectAndRun(context.Background())
+		if handshook {
+			// A connection that actually came up resets the backoff, so a
+			// routine drop after hours of uptime reconnects in ~1s rather
+			// than inheriting the 60s cap from some earlier failure streak.
+			backoff = time.Second
+		}
 		c.maybeLogSustainedDegradation()
 		c.log.Warn().Err(err).Dur("retry_in", backoff).Msg("GroupMe push websocket disconnected, reconnecting")
 		time.Sleep(backoff)
