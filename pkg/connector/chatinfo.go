@@ -46,6 +46,41 @@ func avatarFor(url string) *bridgev2.Avatar {
 	}
 }
 
+// avatarIfSet is avatarFor, except that an empty URL means "no information,
+// leave the avatar alone" (nil) rather than "remove it". Used everywhere a
+// person's avatar comes from a source that can't be trusted to mean "this
+// person has no picture" when it's blank.
+func avatarIfSet(url string) *bridgev2.Avatar {
+	if url == "" {
+		return nil
+	}
+	return avatarFor(url)
+}
+
+// ghostHasRealName reports whether a ghost already has a proper name, as
+// opposed to none or the raw-numeric-ID fallback.
+func ghostHasRealName(ghost *bridgev2.Ghost) bool {
+	return ghost != nil && ghost.Name != "" && ghost.Name != string(ghost.ID)
+}
+
+// A person has exactly one Matrix profile (their ghost), shared by every
+// room, but GroupMe gives them a separate nickname and avatar in every
+// group. Letting each group's resync write its own nickname/avatar into the
+// one shared profile made it flip between groups on every restart --
+// confirmed live on 2026-09-25: 138 profile writes in one restart, e.g.
+// "AJ" <-> "AJ Ball", "Baker Long 2" <-> "Baker Long", avatars swapping
+// between two different per-group pictures, and each flip posting a
+// "changed their name/profile picture" event into every shared room. (bridgev2
+// v0.31's ChatMember.Nickname, which would allow real per-room names, is
+// documented "Not yet used".) So every source now agrees on one identity:
+//
+//   - Name: the account-wide name (group member "name", DM other_user.name),
+//     never a per-group nickname, except as a fallback when nothing else
+//     is known.
+//   - Avatar: set from account-level data (the DM chats list, contacts);
+//     a group's per-group picture only fills in a missing avatar, never
+//     replaces or removes one.
+
 func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
 	portalType, gmid := ParsePortalID(portal.ID)
 	switch portalType {
@@ -60,14 +95,25 @@ func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*
 		}
 		for _, m := range group.Members {
 			isFromMe := m.UserID == groupme.ID(gc.Meta.GMID)
-			// Use the per-group nickname GroupMe already gave us in the
-			// member list, rather than relying on GetUserInfo's
-			// IndexRelations (personal contacts) lookup, which only knows
-			// about people the logged-in user has DMed 1:1 -- other group
-			// members fell through to a raw-numeric-ID fallback there.
-			name := m.Nickname
+			// Use the names GroupMe already gave us in the member list,
+			// rather than relying on GetUserInfo's IndexRelations
+			// (personal contacts) lookup, which only knows about people
+			// the logged-in user has DMed 1:1 -- other group members fell
+			// through to a raw-numeric-ID fallback there. Account name
+			// first, per-group nickname only as a fallback (see above).
+			name := m.Name
+			if name == "" {
+				name = m.Nickname
+			}
 			if name == "" {
 				name = string(m.UserID)
+			}
+			info := &bridgev2.UserInfo{Name: ptr.Ptr(name)}
+			if m.ImageURL != "" {
+				ghost, err := gc.Main.br.GetExistingGhostByID(ctx, MakeUserID(m.UserID))
+				if err == nil && (ghost == nil || ghost.AvatarMXC == "") {
+					info.Avatar = avatarFor(m.ImageURL)
+				}
 			}
 			members.MemberMap.Set(bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{
@@ -75,10 +121,7 @@ func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*
 					Sender:   MakeUserID(m.UserID),
 				},
 				Membership: "join",
-				UserInfo: &bridgev2.UserInfo{
-					Name:   ptr.Ptr(name),
-					Avatar: avatarFor(m.ImageURL),
-				},
+				UserInfo:   info,
 			})
 		}
 		roomType := database.RoomTypeDefault
@@ -136,12 +179,22 @@ func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*
 			}
 		}
 		roomType := database.RoomTypeDM
+		// Hand the account-level profile we just looked up to the ghost
+		// directly. Without it, bridgev2 fell back to GetUserInfo, which
+		// only checks personal contacts and set the ghost's name to the
+		// raw numeric ID for anyone not in them (seen live: "Hilton
+		// Sampson" -> "94228122" -> back, on one restart).
+		var otherInfo *bridgev2.UserInfo
+		if found {
+			otherInfo = &bridgev2.UserInfo{Name: ptr.Ptr(name), Avatar: avatarIfSet(avatarURL)}
+		}
 		members := &bridgev2.ChatMemberList{
 			IsFull: true,
 			MemberMap: bridgev2.ChatMemberMap{
 				MakeUserID(gmid): bridgev2.ChatMember{
 					EventSender: bridgev2.EventSender{Sender: MakeUserID(gmid)},
 					Membership:  "join",
+					UserInfo:    otherInfo,
 				},
 				MakeUserID(groupme.ID(gc.Meta.GMID)): bridgev2.ChatMember{
 					EventSender: bridgev2.EventSender{IsFromMe: true, Sender: MakeUserID(groupme.ID(gc.Meta.GMID))},
@@ -152,7 +205,7 @@ func (gc *GMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*
 		}
 		return &bridgev2.ChatInfo{
 			Name:    ptr.Ptr(name),
-			Avatar:  avatarFor(avatarURL),
+			Avatar:  avatarIfSet(avatarURL),
 			Members: members,
 			Type:    &roomType,
 		}, nil
@@ -171,7 +224,7 @@ func (gc *GMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*br
 		if u.ID == gmid {
 			return &bridgev2.UserInfo{
 				Name:   ptr.Ptr(u.Name),
-				Avatar: avatarFor(u.AvatarURL),
+				Avatar: avatarIfSet(u.AvatarURL),
 			}, nil
 		}
 	}
@@ -180,9 +233,14 @@ func (gc *GMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*br
 		if err == nil {
 			return &bridgev2.UserInfo{
 				Name:   ptr.Ptr(me.Name),
-				Avatar: avatarFor(me.AvatarURL),
+				Avatar: avatarIfSet(me.AvatarURL),
 			}, nil
 		}
+	}
+	// Not in contacts. Don't overwrite a name we already have (e.g. from a
+	// group member list) with the raw ID -- that's strictly worse info.
+	if ghostHasRealName(ghost) {
+		return &bridgev2.UserInfo{}, nil
 	}
 	return &bridgev2.UserInfo{Name: ptr.Ptr(string(gmid))}, nil
 }

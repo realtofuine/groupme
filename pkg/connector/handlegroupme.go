@@ -150,9 +150,20 @@ func (gc *GMClient) HandleTextMessage(msg groupme.Message) {
 					Msg("Failed to get ghost for opportunistic name refresh from message")
 				return
 			}
-			info := &bridgev2.UserInfo{Name: ptr.Ptr(name)}
-			if avatarURL != "" {
+			// 4. Fill gaps only. A message's name/avatar are the sender's
+			//    *per-group* nickname and picture, so even a genuinely
+			//    new message would flip the one shared profile between
+			//    groups (see the identity note in chatinfo.go). The group
+			//    and DM resyncs own the account-level name/avatar.
+			info := &bridgev2.UserInfo{}
+			if !ghostHasRealName(ghost) {
+				info.Name = ptr.Ptr(name)
+			}
+			if avatarURL != "" && ghost.AvatarMXC == "" {
 				info.Avatar = avatarFor(avatarURL)
+			}
+			if info.Name == nil && info.Avatar == nil {
+				return
 			}
 			ghost.UpdateInfo(ctx, info)
 		}(msg.UserID, msg.Name, msg.AvatarURL, MakeMessageID(msg.ID))

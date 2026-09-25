@@ -1348,3 +1348,57 @@ Also seen and left alone: WhatsApp's 4 routine 503 stream-end reconnects
 inside Synapse's own scheduler, triggered by the join burst when a bridge
 restarts; harmless), and a few `403 not invited` join denials (bridgev2
 tries the join, then invites and retries).
+
+## Profiles flip-flopping between groups on every restart (2026-09-25)
+
+After the 2026-09-24 deploy, the restart resync made 138 profile writes
+(102 names, 36 avatars) and 38 media uploads in about a minute. None were
+needed. There were two causes.
+
+**Per-group nicknames and avatars fighting over one profile.** GroupMe gives
+each person a separate nickname and picture in every group. Matrix gives
+each person one profile (their ghost), shared by every room. Each group's
+resync wrote its own nickname/avatar into that shared profile, so it
+flipped on every restart: "AJ" / "AJ Ball", "Baker Long 2" / "Baker Long",
+"Nico" / "Nico Costa", avatars swapping between two different per-group
+pictures. A blank per-group picture removed the avatar outright. Every flip
+posts a "changed their name/profile picture" event into every room that
+person is in. bridgev2 v0.31's `ChatMember.Nickname` (real per-room names)
+is documented "Not yet used", and member events are only resent when
+membership changes. So per-room nicknames aren't available, and the fix is
+one consistent identity per person:
+
+- Name: the account-wide name. The group member list has it as `name`,
+  next to the per-group `nickname`; I added `Member.Name` to groupme-lib.
+  The nickname is only a fallback.
+- Avatar: account-level sources (DM chats list, contacts) set it. A group's
+  per-group picture only fills in a missing avatar and never replaces or
+  removes one. `avatarIfSet` treats a blank URL as "no info" rather than
+  "remove".
+- The new-message refresh in handlegroupme.go now only fills gaps (a missing
+  name, or the raw-ID placeholder, or a missing avatar). Message snapshots
+  carry per-group nicknames/pictures too.
+
+Trade-off: a person who is only in groups (never DMed) keeps whichever
+per-group picture was seen first until it's cleared. Where someone set a
+more descriptive nickname than their account name, Matrix now shows the
+account name.
+
+**DM resync set names to the raw ID.** The DM member entry carried no
+profile, so bridgev2 fell back to `GetUserInfo`, which only checks personal
+contacts and returned the raw numeric ID for anyone not in them. For
+example, "Hilton Sampson" became "94228122" until a group resync set it
+back. The DM member now carries the name/avatar already looked up from the
+chats list. `GetUserInfo` no longer downgrades an existing real name to the
+ID.
+
+Deploy result: the first restart switched 363 people from nickname to
+account name, once each with no repeats. 304 of them were in "FREE FOOD!"
+(4,175 members, 399 with nickname != name).
+
+Second restart: 0 name writes (was 102 before the fix). The remaining
+catch-up converged in one pass. 14 "Ghost profile drifted" warnings were
+FREE FOOD member events still carrying old nicknames; bridgev2's
+`reconcileProfile` re-pushed them, and all 14 were verified afterwards to
+match their profile in that room. 4 DM room avatars and 1 ghost avatar were
+switched to the account-level picture.
